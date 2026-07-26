@@ -13,43 +13,52 @@ import _ "github.com/xavidop/mamori/providers/vault"
 
 Every provider that ships in this repo passes the conformance kit (see **Write a provider**). Pick one from the sidebar for its scheme, ref grammar, auth, and examples.
 
-| Scheme | Page | Sensitive | Watch |
-| --- | --- | --- | --- |
-| `env:` | env | no | poll |
-| `dotenv://` | dotenv | no | fsnotify |
-| `file://` | file | no | fsnotify |
-| `exec:` | exec | yes | poll |
-| `aws-sm://` `aws-ps://` | AWS | yes / secure | poll |
-| `vault://` | Vault | yes | lease-aware poll |
-| `gcp-sm://` | GCP | yes | poll |
-| `azure-kv://` | Azure | yes | poll |
-| `doppler://` | Doppler | yes | poll |
-| `op://` | 1Password | yes | poll |
-| `sops://` | SOPS | yes | fsnotify |
-| `postgres://` | PostgreSQL | no | **native** (LISTEN/NOTIFY) |
-| `mysql://` | MySQL | no | poll |
-| `sqlite://` | SQLite | no | fsnotify |
-| `mongodb://` | MongoDB | no | **native** (change streams) |
-| `dynamodb://` | DynamoDB | no | poll |
-| `cosmos://` | Cosmos DB | no | poll (ETag) |
-| `redis://` | Redis | no | **native** (keyspace) |
-| `consul://` | Consul | no | **native** |
-| `etcd://` | etcd | no | **native** |
-| `k8s-secret://` `k8s-cm://` | Kubernetes | yes / no | **native** |
-| `firestore://` | Firestore | no | **native** (snapshots) |
-| `firebase-rc://` | Remote Config | no | poll |
-| `firebase-rtdb://` | Realtime DB | no | **native** (streaming) |
-| `s3://` | Amazon S3 | no | poll (ETag) |
-| `gcs://` | Google GCS | no | poll (generation) |
-| `azblob://` | Azure Blob | no | poll (ETag) |
-| `launchdarkly://` | LaunchDarkly | no | **native** (streaming) |
-| `unleash://` | Unleash | no | poll |
-| `flagsmith://` | Flagsmith | no | poll |
-| `configcat://` | ConfigCat | no | poll |
-| `split://` | Split | no | poll |
-| `growthbook://` | GrowthBook | no | poll |
-| `flipt://` | Flipt | no | poll |
-| `goff://` | GO Feature Flag | no | poll |
+The **Errors** column shows which providers classify a failure beyond `not_found`, mapping backend-specific errors onto `mamori.ErrorKind` values like `permission_denied`, `unauthenticated`, `unavailable`, `rate_limited`, and `invalid`. The classification sweep across the whole catalog is now complete, and every provider falls into exactly one of three honest states:
+
+- **✅** - classifies real backend errors beyond `not_found`: thirty providers across twenty-seven modules (the `env:` / `dotenv://` / `file://` / `exec:` rows are one core module, counted as four providers).
+- **no (chain preserved)** - `firebase-rtdb`, `growthbook`, and `flagsmith` have no backend-specific error vocabulary to map, so a non-not-found failure still reports `unknown`, but `Resolve` wraps the underlying error with `%w` rather than flattening it, so `errors.Is`/`errors.As` still reach it. This is not classification; it is proof that the chain survives even where there is nothing more specific to name.
+- **n/a (no error surface)** - `unleash`, `configcat`, and `split` wrap client surfaces that return only `bool`/`string`, with no per-key error at all, so `Resolve` can only ever produce `not_found` or a client-construction error. Each is explicitly exempt from the conformance kit's `ErrorClassification` case via `providertest.Config.NoResolveErrors`, a deliberate, greppable opt-out rather than a silent gap.
+
+Don't read either non-✅ state as broken: `not_found` is detected everywhere regardless of this column, and neither state claims to see permission or availability errors that provider genuinely cannot observe.
+
+| Scheme | Page | Sensitive | Watch | Errors |
+| --- | --- | --- | --- | --- |
+| `env:` | env | no | poll | ✅ |
+| `dotenv://` | dotenv | no | fsnotify | ✅ |
+| `file://` | file | no | fsnotify | ✅ |
+| `exec:` | exec | yes | poll | ✅ |
+| `mamori://` | mamori (client) | passthrough | **native** (SSE) | ✅ |
+| `aws-sm://` `aws-ps://` | AWS | yes / secure | poll | ✅ |
+| `vault://` | Vault | yes | lease-aware poll | ✅ |
+| `gcp-sm://` | GCP | yes | poll | ✅ |
+| `azure-kv://` | Azure | yes | poll | ✅ |
+| `doppler://` | Doppler | yes | poll | ✅ |
+| `op://` | 1Password | yes | poll | ✅ |
+| `sops://` | SOPS | yes | fsnotify | ✅ |
+| `postgres://` | PostgreSQL | no | **native** (LISTEN/NOTIFY) | ✅ |
+| `mysql://` | MySQL | no | poll | ✅ |
+| `sqlite://` | SQLite | no | fsnotify | ✅ |
+| `mongodb://` | MongoDB | no | **native** (change streams) | ✅ |
+| `dynamodb://` | DynamoDB | no | poll | ✅ |
+| `cosmos://` | Cosmos DB | no | poll (ETag) | ✅ |
+| `redis://` | Redis | no | **native** (keyspace) | ✅ |
+| `consul://` | Consul | no | **native** | ✅ |
+| `etcd://` | etcd | no | **native** | ✅ |
+| `k8s-secret://` `k8s-cm://` | Kubernetes | yes / no | **native** | ✅ |
+| `firestore://` | Firestore | no | **native** (snapshots) | ✅ |
+| `firebase-rc://` | Remote Config | no | poll | ✅ |
+| `firebase-rtdb://` | Realtime DB | no | **native** (streaming) | no (chain preserved) |
+| `s3://` | Amazon S3 | no | poll (ETag) | ✅ |
+| `gcs://` | Google GCS | no | poll (generation) | ✅ |
+| `azblob://` | Azure Blob | no | poll (ETag) | ✅ |
+| `launchdarkly://` | LaunchDarkly | no | **native** (streaming) | ✅ |
+| `unleash://` | Unleash | no | poll | n/a (no error surface) |
+| `flagsmith://` | Flagsmith | no | poll | no (chain preserved) |
+| `configcat://` | ConfigCat | no | poll | n/a (no error surface) |
+| `split://` | Split | no | poll | n/a (no error surface) |
+| `growthbook://` | GrowthBook | no | poll | no (chain preserved) |
+| `flipt://` | Flipt | no | poll | ✅ |
+| `goff://` | GO Feature Flag | no | poll | ✅ |
 
 ## Choosing and configuring a provider
 
@@ -65,9 +74,11 @@ cfg, err := mamori.Load[Config](ctx,
 
 `WithProvider` takes precedence over the registry for that scheme, for that call only.
 
+The [mamori (client)](/docs/providers/mamori/) provider is the one shipped provider with no zero-config default at all: a `mamori://` binding name only means something relative to one specific config server, so it is always constructed explicitly with `mamoriprov.New(mamoriprov.Config{Endpoint: ...})` and passed via `WithProvider`, never registered from a blank import. It is also structurally different from every other row in the table above: it is not itself a secret manager, database, or flag service, it is a client for the [config server](/docs/server/), a fan-out process that fronts one of those backends and re-serves it to many callers. `Sensitive` and error classification are marked "passthrough" for it because both are whatever its upstream backend reports, carried through the hop unchanged, rather than a property fixed by this provider itself.
+
 ## Watch behavior
 
-- **native** - the backend pushes changes (Kubernetes watch API, Consul blocking queries). mamori subscribes directly.
+- **native** - the backend pushes changes (Kubernetes watch API, Consul blocking queries, a mamori config server's `/v1/watch` Server-Sent Events stream). mamori subscribes directly.
 - **fsnotify** - a local file is watched for writes (built-in `file://`, `sops://`).
 - **lease-aware poll** - polling, but `Value.NotAfter` from a Vault lease triggers a refresh before expiry.
 - **poll** - mamori polls on `WithPollInterval` with jitter, using `Value.Version` to detect change.

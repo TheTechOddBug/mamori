@@ -1,11 +1,23 @@
 ---
+import type { MarkdownHeading } from "astro";
 import Layout from "./Layout.astro";
 import Search from "../components/Search.astro";
 
-const { frontmatter } = Astro.props;
+const { frontmatter, headings = [] } = Astro.props as {
+  frontmatter?: { title?: string };
+  headings?: MarkdownHeading[];
+};
 const title = frontmatter?.title
   ? `${frontmatter.title} - mamori docs`
   : "mamori docs";
+
+// In-page table of contents: the h2/h3 headings of the current page, rendered
+// on the right with scroll-spy so a reader always sees where they are. Astro
+// generates a slug for every heading (matching the anchor id it emits), so the
+// links here point straight at those anchors. Rendered only when a page has
+// enough structure to be worth navigating (2+ entries).
+const pageHeadings = headings.filter((h) => h.depth === 2 || h.depth === 3);
+const showPageToc = pageHeadings.length >= 2;
 
 const base = import.meta.env.BASE_URL;
 
@@ -15,9 +27,15 @@ const groups = [
     label: "Start",
     items: [
       { slug: "", title: "Introduction" },
+      { slug: "quickstart", title: "Quick start" },
       { slug: "comparison", title: "Why mamori" },
       { slug: "concepts", title: "Concepts" },
+      { slug: "concepts/source-chains", title: "Source chains", indent: true },
+      { slug: "concepts/error-kinds", title: "Error kinds", indent: true },
+      { slug: "concepts/secret-types", title: "Secret types", indent: true },
       { slug: "usage", title: "Loading & watching" },
+      { slug: "usage/watching", title: "Watching", indent: true },
+      { slug: "usage/snapshots", title: "Snapshots & pinning", indent: true },
       { slug: "validation", title: "Validation" },
     ],
   },
@@ -25,12 +43,12 @@ const groups = [
     label: "Providers",
     items: [
       { slug: "providers", title: "Overview" },
-      { slug: "writing-a-provider", title: "Write a provider" },
       { subhead: "Built-in" },
       { slug: "providers/env", title: "env", indent: true },
       { slug: "providers/dotenv", title: "dotenv", indent: true },
       { slug: "providers/file", title: "file", indent: true },
       { slug: "providers/exec", title: "exec", indent: true },
+      { slug: "providers/mamori", title: "mamori (client)", indent: true },
       { subhead: "Secret managers" },
       { slug: "providers/aws", title: "AWS", indent: true },
       { slug: "providers/vault", title: "Vault", indent: true },
@@ -72,31 +90,72 @@ const groups = [
     ],
   },
   {
+    label: "Observe",
+    items: [
+      { slug: "observability", title: "Observability" },
+      { slug: "observability/doctor", title: "Doctor", indent: true },
+      { slug: "observability/admin", title: "Admin endpoint", indent: true },
+      { slug: "opentelemetry", title: "OpenTelemetry" },
+    ],
+  },
+  {
+    label: "Serve",
+    items: [
+      { slug: "server", title: "Config server" },
+      { slug: "server/bindings", title: "Bindings", indent: true },
+      { slug: "server/transports", title: "Deploy & expose", indent: true },
+      { slug: "server/authorization", title: "Auth & policy", indent: true },
+      { slug: "server/ha", title: "High availability", indent: true },
+      { slug: "server/wire-protocol", title: "Wire protocol", indent: true },
+      { slug: "auth", title: "Auth" },
+      { slug: "auth/schemes", title: "Schemes", indent: true },
+      { slug: "auth/custom", title: "Custom & rotation", indent: true },
+    ],
+  },
+  {
     label: "Extend",
     items: [
       { slug: "middleware", title: "Middleware" },
-      { slug: "opentelemetry", title: "OpenTelemetry" },
-      { slug: "reconcilevet", title: "reconcilevet" },
+      { slug: "writing-a-provider", title: "Write a provider" },
+      { slug: "writing-a-provider/resolve", title: "Resolve & errors", indent: true },
+      { slug: "writing-a-provider/capabilities", title: "Watch & batch", indent: true },
+      { slug: "writing-a-provider/conformance", title: "Conformance", indent: true },
+    ],
+  },
+  {
+    label: "Tooling",
+    items: [
+      { slug: "cli", title: "CLI" },
+      { slug: "cli/explain", title: "explain", indent: true },
+      { slug: "cli/schema", title: "schema", indent: true },
+      { slug: "cli/policy", title: "policy", indent: true },
+      { slug: "cli/vet", title: "vet", indent: true },
+      { slug: "cli/doctor-status", title: "doctor & status", indent: true },
+      { slug: "testing", title: "Testing" },
+      { slug: "skill", title: "Agent skill" },
     ],
   },
   {
     label: "More",
     items: [
-      { slug: "samples", title: "Samples" },
       { slug: "security", title: "Security & releases" },
       { slug: "getting-help", title: "Getting help" },
     ],
   },
 ];
 
+// Emit directory-style hrefs with a trailing slash (paired with
+// trailingSlash: "always" in astro.config) so relative links inside pages
+// resolve the same way no matter how the visitor arrived.
 const hrefFor = (slug?: string) => {
-  const p = (base + "docs/" + (slug ?? "")).replace(/\/+$/, "");
-  return p === "" ? "/" : p;
+  const s = slug ?? "";
+  return base + "docs/" + (s ? s + "/" : "");
 };
-const here = Astro.url.pathname.replace(/\/+$/, "") || "/";
+const norm = (p: string) => p.replace(/\/+$/, "") || "/";
+const here = norm(Astro.url.pathname);
 
 const flat = groups.flatMap((g) => g.items).filter((i) => typeof i.slug === "string");
-const idx = flat.findIndex((i) => hrefFor(i.slug) === here);
+const idx = flat.findIndex((i) => norm(hrefFor(i.slug)) === here);
 const prev = idx > 0 ? flat[idx - 1] : null;
 const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
 ---
@@ -124,10 +183,10 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
                     <li>
                       <a
                         href={hrefFor(i.slug)}
-                        aria-current={hrefFor(i.slug) === here ? "page" : undefined}
+                        aria-current={norm(hrefFor(i.slug)) === here ? "page" : undefined}
                         class:list={[
                           "toc__link",
-                          { "toc__link--active": hrefFor(i.slug) === here },
+                          { "toc__link--active": norm(hrefFor(i.slug)) === here },
                           { "toc__link--indent": i.indent },
                         ]}
                       >
@@ -167,13 +226,35 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
         }
       </nav>
     </article>
+
+    {
+      showPageToc && (
+        <aside class="page-toc" aria-label="On this page">
+          <p class="page-toc__title">On this page</p>
+          <ul>
+            {pageHeadings.map((h) => (
+              <li
+                class:list={[
+                  "page-toc__item",
+                  { "page-toc__item--sub": h.depth === 3 },
+                ]}
+              >
+                <a href={`#${h.slug}`} class="page-toc__link" data-toc-link={h.slug}>
+                  {h.text}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </aside>
+      )
+    }
   </div>
 </Layout>
 
 <style is:global>
   .docs {
     display: grid;
-    grid-template-columns: 220px minmax(0, 1fr);
+    grid-template-columns: 220px minmax(0, 1fr) 200px;
     gap: 3rem;
     padding-block: 3rem 4rem;
     align-items: start;
@@ -249,8 +330,16 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
   }
 
   .doc {
-    max-width: 74ch;
+    max-width: 880px;
     font-size: 1.02rem;
+  }
+  /* Keep prose at a readable measure, but let tables, code, and diagrams use
+     the full content width so wide tables are not cramped. */
+  .doc > p,
+  .doc > ul,
+  .doc > ol,
+  .doc > blockquote {
+    max-width: 72ch;
   }
   .doc > :first-child {
     margin-top: 0;
@@ -323,6 +412,124 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
     border: 0;
     padding: 0;
   }
+  /* Mermaid diagrams: before the client renderer runs, hide the raw source; once
+     rendered, present the SVG as a centered, bordered figure. */
+  .doc pre.mermaid {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    margin: 1.8rem 0;
+    text-align: center;
+    line-height: normal;
+    font-family: var(--font-body);
+    color: transparent;
+    overflow-x: auto;
+  }
+  .doc pre.mermaid[data-processed="true"] {
+    color: inherit;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 1.4rem 1.2rem;
+  }
+  .doc pre.mermaid svg {
+    max-width: 100%;
+    height: auto;
+  }
+  /* Rendered diagrams are click-to-zoom. */
+  .doc pre.mermaid[data-processed="true"] {
+    position: relative;
+    cursor: zoom-in;
+  }
+  .mermaid-zoom {
+    position: absolute;
+    top: 0.6rem;
+    right: 0.6rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    opacity: 0;
+    transition: opacity 0.18s var(--ease);
+    pointer-events: none;
+  }
+  .doc pre.mermaid[data-processed="true"]:hover .mermaid-zoom {
+    opacity: 1;
+  }
+
+  /* Full-screen diagram viewer (zoom + pan). */
+  .diagram-modal[hidden] {
+    display: none;
+  }
+  .diagram-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .diagram-modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: color-mix(in srgb, var(--ink) 78%, transparent);
+    backdrop-filter: blur(2px);
+  }
+  .diagram-modal__stage {
+    position: relative;
+    z-index: 1;
+    width: 94vw;
+    height: 88vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    cursor: grab;
+    touch-action: none;
+  }
+  .diagram-modal__stage:active {
+    cursor: grabbing;
+  }
+  .diagram-modal__stage svg {
+    max-width: 90vw;
+    max-height: 84vh;
+    height: auto;
+    transform-origin: center center;
+    will-change: transform;
+    background: var(--bg-2);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+  }
+  .diagram-modal__toolbar {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    z-index: 2;
+    display: flex;
+    gap: 0.4rem;
+  }
+  .diagram-modal__toolbar button {
+    min-width: 2.2rem;
+    height: 2.2rem;
+    padding: 0 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color 0.18s var(--ease);
+  }
+  .diagram-modal__toolbar button:hover {
+    border-color: var(--green);
+  }
   .doc blockquote {
     margin: 1.4rem 0;
     padding: 0.6rem 1.1rem;
@@ -338,22 +545,23 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
     width: 100%;
     border-collapse: collapse;
     margin: 1.2rem 0;
-    font-size: 0.9rem;
+    font-size: 0.86rem;
     display: block;
     overflow-x: auto;
   }
   .doc th,
   .doc td {
     text-align: left;
-    padding: 0.55rem 0.8rem;
+    padding: 0.5rem 0.6rem;
     border-bottom: 1px solid var(--line);
     color: var(--muted);
+    vertical-align: top;
   }
   .doc th {
     color: var(--ink);
     font-family: var(--font-mono);
-    font-size: 0.78rem;
-    letter-spacing: 0.03em;
+    font-size: 0.74rem;
+    letter-spacing: 0.02em;
   }
   .doc td code {
     white-space: nowrap;
@@ -400,6 +608,56 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
     color: var(--green-deep);
   }
 
+  .page-toc {
+    position: sticky;
+    top: 84px;
+    max-height: calc(100vh - 100px);
+    overflow-y: auto;
+    font-size: 0.85rem;
+  }
+  .page-toc__title {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted-2);
+    margin: 0 0 0.6rem;
+  }
+  .page-toc ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.1rem;
+    border-left: 1px solid var(--line);
+  }
+  .page-toc__item {
+    margin: 0;
+  }
+  .page-toc__link {
+    display: block;
+    color: var(--muted-2);
+    padding: 0.25rem 0.8rem;
+    margin-left: -1px;
+    border-left: 2px solid transparent;
+    line-height: 1.35;
+    transition:
+      color 0.2s var(--ease),
+      border-color 0.2s var(--ease);
+  }
+  .page-toc__item--sub .page-toc__link {
+    padding-left: 1.6rem;
+    font-size: 0.8rem;
+  }
+  .page-toc__link:hover {
+    color: var(--green-deep);
+  }
+  .page-toc__link--active {
+    color: var(--green-deep);
+    border-left-color: var(--green);
+    font-weight: 500;
+  }
+
   .toc__toggle {
     display: none;
     align-items: center;
@@ -420,6 +678,15 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
   }
   .toc[data-open] .toc__toggle svg {
     transform: rotate(180deg);
+  }
+
+  @media (max-width: 1180px) {
+    .docs {
+      grid-template-columns: 220px minmax(0, 1fr);
+    }
+    .page-toc {
+      display: none;
+    }
   }
 
   @media (max-width: 900px) {
@@ -467,6 +734,206 @@ const next = idx >= 0 && idx < flat.length - 1 ? flat[idx + 1] : null;
         toc.removeAttribute("data-open");
         tocToggle.setAttribute("aria-expanded", "false");
       });
+    });
+  }
+
+  // Keep your place in the sidebar across page loads: this is a multi-page
+  // site, so each navigation re-renders the nav scrolled to the top. Bring the
+  // active entry back into view within the nav's own scroll container (only the
+  // container scrolls, never the page), so the sidebar does not jump to the top
+  // every time you follow a link.
+  const tocInner = document.getElementById("toc-nav");
+  const activeLink = tocInner?.querySelector(".toc__link--active");
+  if (tocInner && activeLink) {
+    const c = tocInner.getBoundingClientRect();
+    const a = activeLink.getBoundingClientRect();
+    if (a.top < c.top || a.bottom > c.bottom) {
+      tocInner.scrollTop += a.top - c.top - c.height / 2 + a.height / 2;
+    }
+  }
+</script>
+
+<script>
+  // Scroll-spy for the on-this-page TOC: highlight the section the reader is
+  // currently in. The active heading is the last one whose top has scrolled
+  // above a line ~100px below the viewport top, computed on scroll (throttled
+  // with requestAnimationFrame) so it stays deterministic rather than relying
+  // on IntersectionObserver's fire-order across fast scrolls.
+  const tocLinks = Array.from(document.querySelectorAll("[data-toc-link]"));
+  if (tocLinks.length) {
+    const linkBySlug = new Map(
+      tocLinks.map((a) => [a.getAttribute("data-toc-link"), a]),
+    );
+    const headingEls = tocLinks
+      .map((a) => document.getElementById(a.getAttribute("data-toc-link") || ""))
+      .filter((el) => el !== null);
+
+    let activeSlug: string | null = null;
+    const setActive = (slug: string | null) => {
+      if (slug === activeSlug) return;
+      if (activeSlug) linkBySlug.get(activeSlug)?.classList.remove("page-toc__link--active");
+      activeSlug = slug;
+      if (slug) linkBySlug.get(slug)?.classList.add("page-toc__link--active");
+    };
+
+    const update = () => {
+      let current = headingEls[0];
+      for (const h of headingEls) {
+        if (h.getBoundingClientRect().top - 100 <= 0) current = h;
+        else break;
+      }
+      setActive(current ? current.id : null);
+    };
+
+    let ticking = false;
+    window.addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(() => {
+          update();
+          ticking = false;
+        });
+      },
+      { passive: true },
+    );
+    update();
+  }
+</script>
+
+<script>
+  // Render any mermaid diagrams on the page. mermaid is a sizeable dependency,
+  // so it is dynamically imported only on pages that actually contain a
+  // <pre class="mermaid"> (produced by the remarkMermaid plugin in
+  // astro.config.mjs from a ```mermaid fenced block). Theme variables match the
+  // site palette so diagrams read as part of the page, not a foreign embed.
+  if (document.querySelector("pre.mermaid")) {
+    const mermaid = (await import("mermaid")).default;
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "base",
+      fontFamily: "var(--font-body), system-ui, sans-serif",
+      themeVariables: {
+        primaryColor: "#e8f5ee",
+        primaryBorderColor: "#2f9e68",
+        primaryTextColor: "#14231b",
+        lineColor: "#5b6b62",
+        secondaryColor: "#f3f1ea",
+        tertiaryColor: "#ffffff",
+        fontSize: "14px",
+      },
+    });
+    try {
+      await mermaid.run({ querySelector: "pre.mermaid" });
+      setupDiagramZoom();
+    } catch (err) {
+      console.error("mermaid render failed", err);
+    }
+  }
+
+  // Click-to-maximize for rendered diagrams: a full-screen viewer with wheel /
+  // button zoom and drag-to-pan. Vanilla, no extra dependency.
+  function setupDiagramZoom() {
+    const diagrams = Array.from(
+      document.querySelectorAll('pre.mermaid[data-processed="true"]'),
+    ).filter((pre) => pre.querySelector("svg"));
+    if (!diagrams.length) return;
+
+    const modal = document.createElement("div");
+    modal.className = "diagram-modal";
+    modal.hidden = true;
+    modal.innerHTML =
+      '<div class="diagram-modal__backdrop" data-close></div>' +
+      '<div class="diagram-modal__toolbar">' +
+      '<button data-zoom-out aria-label="Zoom out">-</button>' +
+      '<button data-zoom-reset aria-label="Reset zoom">100%</button>' +
+      '<button data-zoom-in aria-label="Zoom in">+</button>' +
+      '<button data-close aria-label="Close viewer">Close</button>' +
+      "</div>" +
+      '<div class="diagram-modal__stage" data-stage></div>';
+    document.body.appendChild(modal);
+
+    const stage = modal.querySelector("[data-stage]") as HTMLElement;
+    let scale = 1,
+      tx = 0,
+      ty = 0,
+      dragging = false,
+      startX = 0,
+      startY = 0;
+
+    const apply = () => {
+      const svg = stage.firstElementChild as SVGElement | null;
+      if (svg) svg.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    };
+    const setScale = (next: number) => {
+      scale = Math.min(Math.max(next, 0.3), 8);
+      apply();
+    };
+    const open = (svg: SVGElement) => {
+      stage.innerHTML = "";
+      const clone = svg.cloneNode(true) as SVGElement;
+      clone.style.transform = "";
+      stage.appendChild(clone);
+      scale = 1;
+      tx = 0;
+      ty = 0;
+      apply();
+      modal.hidden = false;
+      document.body.style.overflow = "hidden";
+    };
+    const close = () => {
+      modal.hidden = true;
+      document.body.style.overflow = "";
+    };
+
+    diagrams.forEach((pre) => {
+      const hint = document.createElement("span");
+      hint.className = "mermaid-zoom";
+      hint.textContent = "click to zoom";
+      hint.setAttribute("aria-hidden", "true");
+      pre.appendChild(hint);
+      pre.addEventListener("click", () => {
+        const svg = pre.querySelector("svg") as SVGElement | null;
+        if (svg) open(svg);
+      });
+    });
+
+    modal.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", close));
+    modal.querySelector("[data-zoom-in]")?.addEventListener("click", () => setScale(scale * 1.25));
+    modal.querySelector("[data-zoom-out]")?.addEventListener("click", () => setScale(scale / 1.25));
+    modal.querySelector("[data-zoom-reset]")?.addEventListener("click", () => {
+      scale = 1;
+      tx = 0;
+      ty = 0;
+      apply();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (!modal.hidden && e.key === "Escape") close();
+    });
+    stage.addEventListener(
+      "wheel",
+      (e: WheelEvent) => {
+        e.preventDefault();
+        setScale(scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12));
+      },
+      { passive: false },
+    );
+    stage.addEventListener("pointerdown", (e: PointerEvent) => {
+      dragging = true;
+      startX = e.clientX - tx;
+      startY = e.clientY - ty;
+      stage.setPointerCapture(e.pointerId);
+    });
+    stage.addEventListener("pointermove", (e: PointerEvent) => {
+      if (!dragging) return;
+      tx = e.clientX - startX;
+      ty = e.clientY - startY;
+      apply();
+    });
+    stage.addEventListener("pointerup", () => {
+      dragging = false;
     });
   }
 </script>

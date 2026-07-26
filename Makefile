@@ -13,7 +13,7 @@ MODULES := $(shell find . -name go.mod \
 GO ?= go
 export GOWORK = off
 
-.PHONY: all test race lint vet fmt tidy build vet-analyzer work-sync site-dev site-build clean help
+.PHONY: all test race lint vet fmt tidy build vet-analyzer work-sync site-dev site-build site-linkcheck clean help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -42,9 +42,10 @@ fmt: ## gofmt -w the whole tree
 tidy: ## go mod tidy every module
 	@for m in $(MODULES); do echo "==> tidy $$m"; (cd $$m && $(GO) mod tidy) || exit 1; done
 
-vet-analyzer: ## Build reconcilevet and run it over core + examples
-	@cd tools/reconcilevet && $(GO) build -o /tmp/reconcilevet ./cmd/reconcilevet
-	@$(GO) vet -vettool=/tmp/reconcilevet ./... ./examples/...
+vet-analyzer: ## Build the mamori CLI and run the mamori vet analyzer over core + examples (both modes)
+	@cd cmd/mamori && $(GO) build -o /tmp/mamori .
+	@/tmp/mamori vet ./... ./examples/...
+	@$(GO) vet -vettool=/tmp/mamori ./... ./examples/...
 
 work-sync: ## Regenerate the go.work workspace (then re-tidy modules)
 	@GOWORK= $(GO) work sync
@@ -56,5 +57,8 @@ site-dev: ## Run the docs site dev server
 site-build: ## Build the docs site
 	@cd site && npm install && npm run build
 
+site-linkcheck: ## Build the docs site and check for broken internal links
+	@cd site && npm install && npm run build && npm run linkcheck
+
 clean: ## Remove build artifacts
-	@rm -rf dist site/dist site/.astro /tmp/reconcilevet
+	@rm -rf dist site/dist site/.astro /tmp/mamori
