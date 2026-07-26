@@ -185,6 +185,12 @@ type Server struct {
 	resolveMu     sync.Mutex
 	resolveWG     sync.WaitGroup
 
+	// closeDone is created by the single Close call that wins the closed
+	// transition and closed once that call's teardown has finished. Later
+	// Close calls block on it, so every caller is told the server is closed
+	// only when it actually is. Guarded by resolveMu, like closed itself.
+	closeDone chan struct{}
+
 	// unixSpecs and tcpSpecs accumulate Unix and TCP declarations (see
 	// transport.go), in the order given to New, the same way rawBindings and
 	// bindFiles accumulate Bind/BindFile above. Serve (transport.go) binds

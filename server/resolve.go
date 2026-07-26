@@ -408,11 +408,35 @@ func (s *Server) readiness() (state string, ready bool) {
 func (s *Server) Close() error {
 	s.resolveMu.Lock()
 	if s.closed {
+		// Someone else is already closing, or has finished. Wait for their
+		// teardown rather than returning immediately.
+		//
+		// Returning early would make Close's contract a lie: a caller would
+		// be told the server is closed while listeners are still bound and
+		// the Unix socket file is still on disk. That matters most in the
+		// case Close exists to serve, restarting on a fixed socket path,
+		// where a supervisor doing Close-then-rebind would race the outgoing
+		// teardown. It is easy to hit without meaning to, because Serve
+		// itself calls Close when its context is cancelled (see transport.go),
+		// so `cancel(); srv.Close()` is two concurrent closers by
+		// construction, not an unusual thing for a caller to write.
+		done := s.closeDone
 		s.resolveMu.Unlock()
+		if done != nil {
+			<-done
+		}
 		return nil
 	}
 	s.closed = true
+	// closeDone is created by the one caller that wins this transition and
+	// closed when its teardown finishes, which is what every later caller
+	// above blocks on.
+	if s.closeDone == nil {
+		s.closeDone = make(chan struct{})
+	}
+	done := s.closeDone
 	s.resolveMu.Unlock()
+	defer close(done)
 
 	// Announce the shutdown before causing it. Flipping draining makes
 	// GET /v1/readyz answer 503 while every listener is still accepting

@@ -885,3 +885,71 @@ func TestCloseRemovesItsOwnSocket(t *testing.T) {
 		t.Errorf("socket file still present at %s after Close (err=%v), want it unlinked", sockPath, err)
 	}
 }
+
+// TestCloseWaitsForInFlightClose pins Close's contract: when Close returns,
+// the server is actually closed, even if a DIFFERENT goroutine started the
+// teardown first.
+//
+// This is easy to hit by accident. Serve calls Close itself when its context
+// is cancelled (transport.go), so the ordinary `cancel(); srv.Close()` is two
+// concurrent closers. Before, the second caller saw closed=true and returned
+// nil immediately, while listeners were still bound and the Unix socket was
+// still on disk. A supervisor restarting on a fixed socket path would then
+// rebind while the outgoing server was still tearing down.
+//
+// DrainGrace makes the window deterministic rather than a timing race: the
+// winning Close is forced to stay in teardown for the grace period, so a
+// non-waiting Close would demonstrably return while the socket still exists.
+func TestCloseWaitsForInFlightClose(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	p := mamoritest.NewProvider("udswait")
+	p.Set("k", "v1")
+
+	sockPath := shortSocketPath(t)
+	const grace = 300 * time.Millisecond
+
+	s, err := New(
+		WithPolicy(AllowAll()),
+		NoAuth(),
+		Bind("b", "udswait://k"),
+		WithProvider(p),
+		Unix(sockPath, 0o600),
+		DrainGrace(grace),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = s.Serve(ctx) }()
+	waitForAddrs(t, s, 1)
+
+	// Cancelling makes Serve's own watcher call Close, which now holds the
+	// teardown open for the grace period.
+	cancel()
+
+	// Give that first Close time to win the transition, so this really is
+	// the second caller and not the first.
+	time.Sleep(grace / 6)
+
+	start := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// The socket must be gone the moment Close returns. This is the
+	// assertion that fails without the wait.
+	if _, statErr := os.Stat(sockPath); !os.IsNotExist(statErr) {
+		t.Errorf("Close returned after %v but the socket is still present at %s (err=%v); "+
+			"Close must not report success while another teardown is still running",
+			elapsed, sockPath, statErr)
+	}
+
+	// And it must have actually waited, rather than racing through by luck.
+	if elapsed < grace/2 {
+		t.Errorf("Close returned in %v, too fast to have waited for the in-flight teardown (grace %v)", elapsed, grace)
+	}
+}
