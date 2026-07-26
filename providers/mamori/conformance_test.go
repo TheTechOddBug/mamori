@@ -701,7 +701,20 @@ func TestWatchReconnectsOnServerRestartMidWatch(t *testing.T) {
 	srv1 := newSrv()
 	srvCancel1 := startConformanceServer(t, srv1)
 
-	const watchRequestTimeout = 600 * time.Millisecond
+	// This timeout exists to bound a watch stream that the dead server never
+	// closes, so the client is forced to notice and reconnect. It does NOT
+	// need to be short: the server closes the stream itself on shutdown
+	// (teardown cancels the serving context before Shutdown), so this is a
+	// backstop, not the primary signal.
+	//
+	// It used to be 600ms, which was short enough to become the problem. An
+	// http.Client timeout covers the whole request including reading the SSE
+	// body, so on a loaded runner a connection could be cut before its first
+	// frame arrived. Those attempts never count as "established", so they
+	// never reset the backoff, and the client climbs the ladder described at
+	// reconnectTimeout below. Seconds of headroom keep a slow-but-working
+	// connection on the fast path.
+	const watchRequestTimeout = 5 * time.Second
 	_, transport, err := parseEndpoint("unix://"+sockPath, false)
 	if err != nil {
 		t.Fatalf("parseEndpoint: %v", err)
@@ -755,7 +768,31 @@ func TestWatchReconnectsOnServerRestartMidWatch(t *testing.T) {
 
 	up.Set("slot", "after")
 
-	deadline := time.After(pollTimeout)
+	// Recovery gets its own deadline rather than the shared pollTimeout,
+	// because what is being waited on here is a reconnect ladder, not a poll.
+	//
+	// watchLoop backs off geometrically from watchBackoffFloor (100ms),
+	// doubling, with equal jitter, so the cumulative sleep before the Nth
+	// attempt is roughly:
+	//
+	//	after 5 failed attempts: 1.55s - 3.1s
+	//	after 6 failed attempts: 3.15s - 6.3s
+	//	after 7 failed attempts: 6.35s - 12.7s
+	//
+	// A 5s deadline lands INSIDE the 6-attempt band, so on a machine slow
+	// enough for six attempts to fail (a loaded CI runner under -race), the
+	// test becomes a coin flip on jitter rather than a statement about the
+	// client. That is a defect in the test, not the client: backing off is
+	// exactly what the client should do, and it still recovers, just later
+	// than an arbitrary 5s.
+	//
+	// A minute clears the ladder well past any plausible number of failed
+	// attempts while still failing fast enough to be useful if reconnect
+	// genuinely breaks. The assertion is unchanged: the client must recover
+	// on its own, with no new Watch call.
+	const reconnectTimeout = 60 * time.Second
+
+	deadline := time.After(reconnectTimeout)
 	for {
 		select {
 		case u, open := <-ch:
@@ -766,7 +803,7 @@ func TestWatchReconnectsOnServerRestartMidWatch(t *testing.T) {
 				return
 			}
 		case <-deadline:
-			t.Fatal("watch did not reconnect and deliver the post-restart value within the timeout")
+			t.Fatalf("watch did not reconnect and deliver the post-restart value within %s", reconnectTimeout)
 		}
 	}
 }

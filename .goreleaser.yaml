@@ -106,6 +106,13 @@ release:
 brews:
   - name: mamori
     ids: [mamori]
+    # Homebrew resolves a tap's formulae from the Formula/ directory when the
+    # tap has one, and ignores .rb files at the repo root entirely. Without
+    # this, GoReleaser writes mamori.rb to the root of a tap that already has
+    # Formula/ and Casks/ directories, the push succeeds, and
+    # `brew install xavidop/tap/mamori` still reports "No available formula",
+    # which looks like a release failure but is purely a placement problem.
+    directory: Formula
     repository:
       owner: xavidop
       name: homebrew-tap
