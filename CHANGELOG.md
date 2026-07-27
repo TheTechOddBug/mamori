@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+## [1.3.1](https://github.com/xavidop/mamori/compare/v1.3.0...v1.3.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* **server:** Close/Serve data race on listenWG ([#55](https://github.com/xavidop/mamori/issues/55)) ([1333d05](https://github.com/xavidop/mamori/commit/1333d051b5344aa393feef4bdc637a991bf719c3))
+
 # [1.3.0](https://github.com/xavidop/mamori/compare/v1.2.4...v1.3.0) (2026-07-27)
 
 
