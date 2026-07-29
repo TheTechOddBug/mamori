@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+## [1.3.3](https://github.com/xavidop/mamori/compare/v1.3.2...v1.3.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* make WithBackoff actually do something ([#63](https://github.com/xavidop/mamori/issues/63)) ([b6c1d61](https://github.com/xavidop/mamori/commit/b6c1d61941775ca65ab92a13b6e7ca9fa5f6f6f4))
+
 ## [1.3.2](https://github.com/xavidop/mamori/compare/v1.3.1...v1.3.2) (2026-07-28)
 
 
