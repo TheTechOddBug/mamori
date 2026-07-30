@@ -60,11 +60,28 @@ for _, snap := range w.History() {
 
 Retained snapshots hold a full copy of `T`, including any `secret.String` / `secret.Bytes` field's value at that version, even after the live config has since rotated that field away. Enabling history extends how long old secret material stays reachable in process memory, which is why `WithHistory` defaults to `0` (off). Read [Security](/docs/security/#withhistory-retains-past-secrets-in-memory) before enabling it in a service that handles credentials, and size `n` to the operational need you actually have.
 
-`WithHistory(1)` is also what a service validating *incoming* credentials during a rotation overlap needs, accepting either the current or the just-rotated-out value for the window both are momentarily valid. See [Rotation safety](/docs/usage/rotation/#the-credential-overlap-pattern) for the pattern and its memory cost.
+`WithHistory(1)` is also what a service validating *incoming* credentials during a rotation overlap needs, accepting either the current or the just-rotated-out value for the window both are momentarily valid. See [Rotation safety](/docs/usage/rotation/#accepting-both-credentials-during-a-rotation-window) for the pattern and its memory cost.
 
 ## Pin and unpin during a rollout
 
 During a rollout you often want the config to hold still while you investigate, without stopping the watcher: sources keep being watched and reconciled, but whatever `Get()` returns should not shift under you mid-investigation.
+
+A pin freezes only what `Get()` serves. Everything upstream of that keeps moving, which is the whole point:
+
+```mermaid
+flowchart LR
+  subgraph Running["While pinned"]
+    direction TB
+    U["Sources keep being watched"] --> V["Candidates keep being validated"]
+    V --> L["Live keeps advancing<br/>history keeps filling"]
+    V -.->|"a failure still reaches OnError"| E["OnError"]
+    L -. "blocked by the pin" .-> G["Get() stays at Snapshot"]
+  end
+  Running --> Un["Unpin()"]
+  Un --> Now["Get() jumps to the newest<br/>validated snapshot"]
+```
+
+`Status()` reports both numbers, so `Snapshot` is what `Get()` serves and `Live` is what it would serve if you unpinned right now. They are equal, and `Pinned` is false, whenever no pin is held.
 
 ```go
 func (w *Watcher[T]) Pin(version uint64) error // ErrNoSuchSnapshot if version is not retained
