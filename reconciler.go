@@ -663,10 +663,25 @@ func refDebounceOverride(ref Ref) (time.Duration, bool) {
 }
 
 // recordSourceUpdate stores up as the latest state of one position in a
-// field's precedence chain (see srcState), applying the field's Sensitive
-// flag to a delivered value exactly as the pre-chain single-source path
-// always did. It is called on every srcUpdate, before the chain's winner is
-// recomputed.
+// field's precedence chain (see srcState), applying the ref's ?decode=
+// pipeline and then the field's Sensitive flag to a delivered value exactly as
+// the pre-chain single-source path always did. It is called on every
+// srcUpdate, before the chain's winner is recomputed.
+//
+// This is the single funnel every watch-delivered value passes through -
+// start's per-position forwarders feed it from a native WatchableProvider and
+// from the polling adapter alike (see watchRef) - which is why the decode
+// belongs here rather than in either of those. Without it a field with
+// ?decode= would resolve correctly at Load (resolveRef decodes) and then hand
+// the application raw, undecoded bytes from its first update onward: a bug
+// that passes every startup-only test and first appears in production at the
+// moment a secret rotates.
+//
+// Decoding here, rather than later at the winner or at flush, means it happens
+// exactly once and before the value becomes engine state, so recomputeWinner,
+// buildCandidate, and the published snapshot all agree on the same decoded
+// bytes. (buildReport is unaffected either way: it reads only Version, never
+// the bytes - and Version is exactly what applyDecode leaves untouched.)
 func (e *engine[T]) recordSourceUpdate(specIdx, pos int, up Update, sensitive bool) {
 	st := &e.sources[specIdx][pos]
 	st.seen = true
@@ -675,7 +690,22 @@ func (e *engine[T]) recordSourceUpdate(specIdx, pos int, up Update, sensitive bo
 		st.value = Value{}
 		return
 	}
-	val := up.Value
+	// A decode failure is recorded exactly like a transient resolve failure
+	// delivered by the source itself: this position carries the error and no
+	// value, recomputeWinner stops the chain walk here (ErrInvalid is not
+	// ErrNotFound, so it does not fall through to a lower-precedence source),
+	// and loop applies the field's OnFail policy - keeplast by default, which
+	// leaves Get() serving the last good snapshot. Storing Value{} rather than
+	// the raw bytes is what makes "keep the last good value" true: a stored
+	// raw value could win a later recompute and reach the application
+	// undecoded, which is the exact outcome this whole path exists to prevent.
+	dec, err := applyDecode(e.specs[specIdx].Refs[pos], up.Value)
+	if err != nil {
+		st.err = err
+		st.value = Value{}
+		return
+	}
+	val := dec
 	if sensitive {
 		val.Sensitive = true
 	}
@@ -755,6 +785,33 @@ func (e *engine[T]) recomputeWinner(specIdx int) (val Value, pos int, err error)
 // live watch update's raw error is wrapped, so a chain's seeded state and
 // its later-observed state can never format an error differently depending
 // on which one happened to win.
+//
+// Calling Resolve directly does mean this bypasses resolveRef's ?decode=
+// handling, so it applies the pipeline itself - it is a fourth place a Value
+// becomes state that can reach the application, alongside resolveRef,
+// resolveBatchScheme, and recordSourceUpdate. Skipping it here would not be
+// merely cosmetic, and it goes wrong in two different ways depending on
+// whether the winning position's provider supplies a Version:
+//
+//   - Version-less provider (Value.changed falls back to comparing bytes):
+//     the seeded RAW bytes differ from the decoded bytes Load just stored, so
+//     no rotation is needed at all. Any other position reporting in first at
+//     startup triggers a recompute that publishes the raw bytes, and the
+//     application sees a Change carrying an undecoded value. It heals when the
+//     winning position's own watch baseline arrives (raw vs decoded bytes
+//     differ again), so this one is a startup flap - but a flap the
+//     application has already been handed and may have acted on.
+//
+//   - Versioned provider: it takes a rotation landing between Watch's initial
+//     Load and this seed. The seeded state then carries the RAW bytes under
+//     the NEW version, another position's first update publishes them, and the
+//     winning position's own baseline - same new version, correctly decoded -
+//     is discarded by markChanged as unchanged. This is the worse case,
+//     because nothing corrects it until the next revision change at that
+//     position. On a 90-day rotation schedule that is a quarter of serving
+//     undecoded bytes. It is not permanent - the following rotation produces a
+//     version the stale raw value does not match, and the field heals - but
+//     "eventually, at the next rotation" is not a recovery story worth having.
 func (e *engine[T]) seedChainSources(ctx context.Context, spec fieldSpec) []srcState {
 	st := make([]srcState, len(spec.Refs))
 	for i, ref := range spec.Refs {
@@ -768,6 +825,14 @@ func (e *engine[T]) seedChainSources(ctx context.Context, spec fieldSpec) []srcS
 			break
 		}
 		val, err := p.Resolve(ctx, ref)
+		if err == nil {
+			// A decode failure is a non-not-found error, so it falls into the
+			// same branch below as a permission denial: this position is
+			// seeded as terminal and the walk stops, rather than sliding down
+			// to a lower-precedence source on the strength of a
+			// misconfigured coding.
+			val, err = applyDecode(ref, val)
+		}
 		if err == nil {
 			if spec.Sensitive {
 				val.Sensitive = true
