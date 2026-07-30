@@ -232,6 +232,8 @@ func TestSelectPointerErrors(t *testing.T) {
 		{"descend into scalar", "/replicas/0/host/nope", ErrInvalid},
 		{"non-numeric array token", "/replicas/five", ErrInvalid},
 		{"leading zero index", "/replicas/05", ErrInvalid},
+		{"plus-signed index", "/replicas/+1", ErrInvalid},
+		{"negative zero index", "/replicas/-0", ErrInvalid},
 		{"dash token", "/replicas/-", ErrInvalid},
 		{"bad escape", "/replicas/0/a~2b", ErrInvalid},
 		{"trailing tilde", "/replicas/0/a~", ErrInvalid},
@@ -389,22 +391,39 @@ func unescapeToken(tok string) (string, error) {
 	return b.String(), nil
 }
 
-// arrayIndex parses an RFC 6901 array index: either "0", or a non-zero digit
-// followed by digits. A leading zero is rejected rather than silently accepted
-// so that "/05" fails loudly instead of aliasing "/5". The "-" token, which
-// RFC 6901 defines as one-past-the-end for JSON Patch's add operation, can
-// never address an existing value and is rejected for the same reason.
+// arrayIndex parses an RFC 6901 array index. The grammar is digits only,
+// "0" / (%x31-39 *DIGIT): no sign character is permitted at all, so a leading
+// zero is rejected rather than silently accepted (so that "/05" fails loudly
+// instead of aliasing "/5"), and this validates that every byte of tok is an
+// ASCII digit before calling strconv.Atoi, rather than leaning on Atoi's sign
+// tolerance plus post-hoc guards. Atoi alone would accept "+1" as 1 and "-0"
+// as 0 (Go's int has no negative zero for an i < 0 check to catch), letting a
+// pointer like "/replicas/+1" silently address a real element instead of
+// failing loudly. The "-" token, which RFC 6901 defines as one-past-the-end
+// for JSON Patch's add operation, can never address an existing value and is
+// rejected for the same reason.
+//
+// The byte-range check is deliberate rather than unicode.IsDigit: the latter
+// accepts non-ASCII digits such as the Arabic-Indic set, which strconv.Atoi
+// would then reject anyway, turning a clear "not an array index" into a
+// confusing parse failure.
 func arrayIndex(tok string) (int, error) {
-	switch {
-	case tok == "-":
+	switch tok {
+	case "-":
 		return 0, fmt.Errorf("token %q addresses one past the end of the array and can never select a value: %w", tok, ErrInvalid)
-	case tok == "":
+	case "":
 		return 0, fmt.Errorf("empty array index token: %w", ErrInvalid)
-	case len(tok) > 1 && tok[0] == '0':
+	}
+	for i := 0; i < len(tok); i++ {
+		if tok[i] < '0' || tok[i] > '9' {
+			return 0, fmt.Errorf("token %q is not an array index: %w", tok, ErrInvalid)
+		}
+	}
+	if len(tok) > 1 && tok[0] == '0' {
 		return 0, fmt.Errorf("array index %q has a leading zero: %w", tok, ErrInvalid)
 	}
 	i, err := strconv.Atoi(tok)
-	if err != nil || i < 0 {
+	if err != nil {
 		return 0, fmt.Errorf("token %q is not an array index: %w", tok, ErrInvalid)
 	}
 	return i, nil
@@ -530,23 +549,59 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `mamori.SelectKey` behavior from Task 1.
-- Produces: `providertest.Config.NoStructuredPayload bool`, and a `JSONPointerSelection` subtest registered in `Run`.
+- Produces: `providertest.Config.PointerRef func(key, fragment string) string`, and a `JSONPointerSelection` subtest registered in `Run`.
 
-- [ ] **Step 1: Add the opt-out field to `Config`**
+**Design correction, read this before starting.** An earlier draft of this task
+made the case unconditional and appended a fragment to `c.Ref(key)`'s output.
+Both were wrong:
+
+- `Config.Ref` is **not** fragment-free by convention. `vault`
+  (`providers/vault/vault_test.go:137`), `mongodb`
+  (`providers/mongodb/mongodb_test.go:205`), `firestore`
+  (`providers/firestore/firestore_test.go:166`), and `k8s`
+  (`providers/k8s/k8s_test.go:166,206`) all bake `#value` into it, and `doppler`
+  (`providers/doppler/doppler_test.go:346`) bakes `#<key>`. Appending would
+  produce `vault://secret/x#value#/outer/inner`.
+- A fragment does not mean a JSON selector in every provider. See spec section
+  5.5: it is a backend-native key in `k8s` and `doppler`, and means nothing at
+  all in `providers/mamori` (decision D9) or in flag providers returning a bare
+  `bool`. Those providers are **not defective** for lacking pointer support.
+
+Hence: a ref *builder*, and an opt-in case.
+
+- [ ] **Step 1: Add the opt-in field to `Config`**
 
 Insert after the `NoResolveErrors` field in `providertest/providertest.go`:
 
 ```go
-	// NoStructuredPayload declares that this provider's values are never JSON
-	// documents, so fragment selection cannot be exercised against it. A
-	// feature-flag provider returning a bare bool, or a backend whose values are
-	// opaque binary, is the usual case.
+	// PointerRef builds a ref whose #fragment selects a value out of a JSON
+	// payload, given a logical key and the fragment to use (including its
+	// leading '#'). Supply it only when this provider's fragment slot IS a JSON
+	// selector routed through mamori.SelectKey; leave it nil otherwise, and the
+	// JSONPointerSelection case skips.
 	//
-	// Like NoResolveErrors, this is a deliberate, greppable declaration rather
-	// than a silent gap: a provider that stores JSON and does not call
-	// mamori.SelectKey has a real bug, and the JSONPointerSelection case exists
-	// to catch exactly that.
-	NoStructuredPayload bool
+	// It is a builder rather than a bool because Config.Ref is not fragment-free
+	// by convention: several providers bake a fixed fragment into it (vault,
+	// mongodb, firestore, and k8s all produce "...#value"), so the case cannot
+	// simply append its own fragment to Ref's output. A builder lets each
+	// provider say where its selector goes:
+	//
+	//	PointerRef: func(key, frag string) string {
+	//	    return "vault://secret/" + key + frag
+	//	}
+	//
+	// Leaving it nil is not a confession of a gap. A fragment means three
+	// different things across this ecosystem: a JSON selector (most providers),
+	// a backend-native key (a Kubernetes Secret data key, a Doppler secret
+	// name), or nothing at all (providers/mamori never reads ref.Key by design;
+	// a flag provider returning a bare bool has no payload to select from).
+	// Only the first can be tested for pointer support, and the other two are
+	// not defective for failing such a test.
+	//
+	// What this case DOES catch, for a provider that supplies it: hand-rolling a
+	// top-level-only key lookup instead of calling mamori.SelectKey, which
+	// passes every other case in this kit and fails only this one.
+	PointerRef func(key, fragment string) string
 ```
 
 - [ ] **Step 2: Write the conformance case**
@@ -554,14 +609,18 @@ Insert after the `NoResolveErrors` field in `providertest/providertest.go`:
 Add to `providertest/providertest.go`:
 
 ```go
-// testJSONPointerSelection verifies the provider routes its #fragment through
-// mamori.SelectKey, so nested selection works identically everywhere. A
-// provider that hand-rolls a top-level-only key lookup passes every other case
-// in this kit and fails this one.
+// testJSONPointerSelection verifies a provider whose #fragment is a JSON
+// selector routes it through mamori.SelectKey, so nested selection behaves
+// identically everywhere. A provider that hand-rolls a top-level-only key
+// lookup passes every other case in this kit and fails only this one.
+//
+// It skips when Config.PointerRef is nil, because a fragment is not a JSON
+// selector in every provider: it is a backend-native key in some and means
+// nothing in others. See PointerRef's doc comment.
 func testJSONPointerSelection(t *testing.T, c Config) {
 	t.Helper()
-	if c.NoStructuredPayload {
-		t.Skip("providertest: provider declares NoStructuredPayload; values are never JSON documents")
+	if c.PointerRef == nil {
+		t.Skip("providertest: provider supplies no PointerRef; its #fragment is not a JSON selector")
 		return
 	}
 	ctx := context.Background()
@@ -573,13 +632,13 @@ func testJSONPointerSelection(t *testing.T, c Config) {
 		t.Fatalf("Seed: %v", err)
 	}
 
-	cases := []struct{ frag, want string }{
+	ok := []struct{ frag, want string }{
 		{"#/outer/inner", "deep"},
 		{"#/list/1/n", "one"},
 		{"#dotted.key", "literal"}, // literal fragment, not a path
 	}
-	for _, tc := range cases {
-		ref, err := mamori.ParseRef(c.Ref(key) + tc.frag)
+	for _, tc := range ok {
+		ref, err := mamori.ParseRef(c.PointerRef(key, tc.frag))
 		if err != nil {
 			t.Fatalf("ParseRef(%q): %v", tc.frag, err)
 		}
@@ -592,20 +651,22 @@ func testJSONPointerSelection(t *testing.T, c Config) {
 		}
 	}
 
-	ref, err := mamori.ParseRef(c.Ref(key) + "#/outer/absent")
-	if err != nil {
-		t.Fatalf("ParseRef: %v", err)
+	bad := []struct {
+		frag string
+		want error
+	}{
+		{"#/outer/absent", mamori.ErrNotFound},
+		{"#/list/9", mamori.ErrNotFound},
+		{"#/outer/inner/deeper", mamori.ErrInvalid},
 	}
-	if _, err := p.Resolve(ctx, ref); !errors.Is(err, mamori.ErrNotFound) {
-		t.Errorf("absent pointer err = %v, want ErrNotFound", err)
-	}
-
-	ref, err = mamori.ParseRef(c.Ref(key) + "#/outer/inner/deeper")
-	if err != nil {
-		t.Fatalf("ParseRef: %v", err)
-	}
-	if _, err := p.Resolve(ctx, ref); !errors.Is(err, mamori.ErrInvalid) {
-		t.Errorf("descend-into-scalar err = %v, want ErrInvalid", err)
+	for _, tc := range bad {
+		ref, err := mamori.ParseRef(c.PointerRef(key, tc.frag))
+		if err != nil {
+			t.Fatalf("ParseRef(%q): %v", tc.frag, err)
+		}
+		if _, err := p.Resolve(ctx, ref); !errors.Is(err, tc.want) {
+			t.Errorf("Resolve(%q) err = %v, want %v", tc.frag, err, tc.want)
+		}
 	}
 }
 ```
@@ -620,14 +681,33 @@ In `Run`, after the `NotFoundTyped` line:
 	t.Run("JSONPointerSelection", func(t *testing.T) { testJSONPointerSelection(t, c) })
 ```
 
-- [ ] **Step 4: Run the conformance kit across every provider module**
+- [ ] **Step 4: Wire `PointerRef` into the providers whose fragment IS a JSON selector**
 
-Run:
+The case is inert until providers opt in, so opting in the eligible ones is
+part of this task. For each provider module, read how its `Resolve` treats
+`ref.Key`:
+
+- **Calls `mamori.SelectKey`** → add a `PointerRef` to its `providertest.Config`,
+  built from the same shape as its existing `Ref` but with the caller's fragment
+  in place of any baked-in one. For `vault`, whose `Ref` is
+  `"vault://secret/" + key + "#value"`, that is
+  `func(key, frag string) string { return "vault://secret/" + key + frag }`.
+- **Does its own backend-native lookup, or ignores `ref.Key`** → leave
+  `PointerRef` nil. Do not add one to force coverage.
+
+Then run:
 ```bash
 go test -race ./providertest/...
 for d in providers/*/; do (cd "$d" && go test -race ./... 2>&1 | tail -3); done
 ```
-Expected: PASS everywhere, or a clear `NoStructuredPayload` skip. Any provider that fails here stores JSON but does not call `mamori.SelectKey`. Fix by setting `NoStructuredPayload` only if its values genuinely are never JSON; otherwise the provider has a real bug and this case just found it. **Report any such provider rather than silently setting the flag.**
+
+Expected: PASS everywhere, with `JSONPointerSelection` either passing or
+skipping. **A provider that supplies a `PointerRef` and then fails the case has
+a real bug.** Report it; do not remove the `PointerRef` to make the suite green.
+Known suspects from an earlier sweep, to check specifically: `dynamodb` and
+`onepassword`. If either is genuinely broken, leave it failing, report it, and
+stop; those are pre-existing bugs that will be fixed in their own PR outside
+this stack, not folded in here.
 
 - [ ] **Step 5: Commit**
 
@@ -635,15 +715,19 @@ Expected: PASS everywhere, or a clear `NoStructuredPayload` skip. Any provider t
 git add providertest/providertest.go providers/
 git commit -m "test: conformance case for JSON Pointer fragment selection
 
-JSONPointerSelection verifies every provider routes its #fragment through
-mamori.SelectKey, so nested selection, literal dotted keys, and the
-ErrNotFound/ErrInvalid split behave identically across the ecosystem. A
-provider that hand-rolls a top-level-only lookup passes every other case in
-the kit and fails this one.
+JSONPointerSelection verifies a provider whose #fragment is a JSON selector
+routes it through mamori.SelectKey, so nested selection, literal dotted keys,
+and the ErrNotFound/ErrInvalid split behave identically across the ecosystem.
+A provider that hand-rolls a top-level-only lookup passes every other case in
+the kit and fails only this one.
 
-Config.NoStructuredPayload opts out providers whose values are never JSON
-documents, following the NoResolveErrors precedent of an explicit, greppable
-declaration rather than a silent skip.
+The case is opt-in via Config.PointerRef, a ref builder rather than a bool, for
+two reasons. Config.Ref is not fragment-free by convention: vault, mongodb,
+firestore, and k8s all bake #value into it, so the case cannot append its own
+fragment. And a fragment is not a JSON selector everywhere: it is a
+backend-native key in k8s and doppler, and means nothing in providers/mamori,
+which never reads ref.Key by design. Those providers are not defective for
+lacking pointer support, so they supply no PointerRef and the case skips.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
