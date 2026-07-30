@@ -3,6 +3,7 @@ package mamori
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"reflect"
@@ -92,6 +93,20 @@ type Watcher[T any] struct {
 	// separate "closed" signal needed to get the same guarantee.
 	ctx context.Context
 
+	// inPreApply holds the ID of the goroutine currently running a PreApply
+	// hook for this watcher, and 0 whenever no hook is running - which is
+	// always, for a watcher with no gate installed. Only flush arms it (see
+	// runPreApply's mark parameter), so it names the reconciler goroutine and
+	// no other; sendPin is the only reader.
+	//
+	// It is a goroutine ID rather than a bool because the two questions are not
+	// the same one. "Is a hook running" is true for every caller in the process
+	// while a hook runs, and refusing all of them would break correct code that
+	// merely overlapped a rotation. "Is the caller the goroutine that is inside
+	// the hook" is true only for the caller that is genuinely waiting on itself,
+	// which is exactly the set that can never be answered.
+	inPreApply atomic.Uint64
+
 	// adminServer and adminAddrVal are set only when WithAdminHTTP was given to
 	// Watch (see adminhttp.go); both are nil/unset otherwise. adminServer is
 	// used by Close to shut the server down; adminAddrVal backs AdminAddr.
@@ -155,6 +170,35 @@ type srcState struct {
 	err   error // meaningful only when seen && err != nil; may wrap ErrNotFound
 }
 
+// typedPreApply asserts o.preApply back to a func(context.Context, Change[T])
+// error, the concrete type PreApply[T] actually stored (options is not
+// generic, so the field is held as any). It returns (nil, nil) when no hook
+// was installed at all, which is the common case.
+//
+// A hook written against some other T would make a bare comma-ok assertion
+// yield nil, and a nil gate is an OPEN gate: the hook would never be called,
+// no error would ever be emitted, and every rotation (or, on the initial load,
+// the very first configuration) would be applied unverified while the caller
+// believed it had been proven to work first. For onChange the same kind of
+// mismatch costs a dropped notification and the application keeps serving
+// correct configuration; for a gate whose only job is refusing credentials
+// that do not work, silence is the worst available outcome. So this returns a
+// loud error instead, wrapping ErrInvalid and naming both types, and is shared
+// by every caller that can observe this mismatch (Watch, and loadValue for
+// both Load and Watch's initial resolve) so none of them can drift into
+// tolerating it via their own bare assertion.
+func typedPreApply[T any](o *options) (func(context.Context, Change[T]) error, error) {
+	if o.preApply == nil {
+		return nil, nil
+	}
+	fn, ok := o.preApply.(func(context.Context, Change[T]) error)
+	if !ok {
+		var want func(context.Context, Change[T]) error
+		return nil, fmt.Errorf("mamori: PreApply hook has type %T, want %T: %w", o.preApply, want, ErrInvalid)
+	}
+	return fn, nil
+}
+
 // Watch performs an initial, fail-fast Load of T and then keeps it reconciled at
 // runtime, delivering validated, diff-aware updates to OnChange. It returns after
 // the initial configuration is resolved (OnChange fires only on subsequent
@@ -163,6 +207,21 @@ func Watch[T any](ctx context.Context, opts ...Option) (*Watcher[T], error) {
 	o := defaultOptions()
 	for _, opt := range opts {
 		opt(o)
+	}
+
+	// Checked here, before loadValue, so that a mismatched hook is caught
+	// before any provider round trip is spent resolving fields - see
+	// typedPreApply's doc comment for why the mismatch is fatal rather than
+	// tolerated. loadValue itself is called just below (for the initial Load)
+	// and now also runs this same check as part of gating that Load's result
+	// (decision D7); asserting it here again is what buys Watch this earlier,
+	// round-trip-free failure on top of that, not a substitute for it. This
+	// call is also where preApply, below, comes from: it is the value stored
+	// into the engine (e.preApply) for every flush after the initial one, not
+	// merely a discarded probe.
+	preApply, err := typedPreApply[T](o)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg, initial, err := loadValue[T](ctx, o)
@@ -197,6 +256,7 @@ func Watch[T any](ctx context.Context, opts ...Option) (*Watcher[T], error) {
 		blocked:   make(map[string]struct{}),
 		sources:   make([][]srcState, len(specs)),
 		onChange:  onChange,
+		preApply:  preApply,
 		lastGood:  cfg,
 		version:   1, // initial snapshot
 		controlCh: w.control,
@@ -256,6 +316,15 @@ type engine[T any] struct {
 	o        *options
 	specs    []fieldSpec
 	onChange func(Change[T])
+	// preApply gates a candidate before it becomes current (see flush). It is
+	// typed here the same way onChange above is, though Watch refuses a
+	// mismatched hook rather than tolerating the nil this would otherwise
+	// leave (see the assertion there). It is nil only when the caller
+	// installed no hook, and the gate then costs a flush that has changes one
+	// nil check inside runPreApply plus the Change[T] literal flush builds
+	// anyway - arguments are evaluated before the call, so those two copies of
+	// T are paid hook or no hook.
+	preApply func(context.Context, Change[T]) error
 
 	// updated only by the reconciler goroutine:
 	observed map[string]Value  // latest value seen per path (always advances)
@@ -600,7 +669,7 @@ func (e *engine[T]) loop(ctx context.Context, updates <-chan srcUpdate) {
 			e.w.report.Store(e.buildReport())
 
 		case <-timerC:
-			e.flush(pending)
+			e.flush(ctx, pending)
 			pending = map[string]struct{}{}
 			disarm()
 			e.w.report.Store(e.buildReport())
@@ -972,20 +1041,82 @@ func (e *engine[T]) buildCandidate() (cand T, fields []FieldChange, ok bool) {
 	return cand, fields, true
 }
 
-// flush builds a candidate from all observed values, validates it, and either
-// applies it (emitting a Change) or rejects it (emitting OnError). Building,
-// validating, advancing the version, and recording history all happen
-// whether or not the watcher is pinned: pinning only changes what happens
-// after that. While pinned, the candidate is not stored to cfg and no Change
-// is enqueued, so Get stays frozen and OnChange stays silent; Unpin later
-// applies the newest such candidate and emits one Change coalescing
-// everything that changed while pinned (see handlePin's unpin case).
-func (e *engine[T]) flush(pending map[string]struct{}) {
+// flush builds a candidate from all observed values, validates it, puts it
+// past the PreApply gate, and then either applies it (emitting a Change) or
+// rejects it (emitting OnError). Building, validating, gating, advancing the
+// version, and recording history all happen whether or not the watcher is
+// pinned: pinning only changes what happens after that. While pinned, the
+// candidate is not stored to cfg and no Change is enqueued, so Get stays
+// frozen and OnChange stays silent; Unpin later applies the newest such
+// candidate and emits one Change coalescing everything that changed while
+// pinned (see handlePin's unpin case).
+//
+// ctx is the reconciler's own context (loop's, which is Watch's wctx). It is
+// threaded in rather than held on the engine because the gate is the first
+// thing here that can block: cancelling the watcher has to release a hook
+// waiting on an unresponsive backend, rather than leaving Close to wait out
+// the hook's full budget.
+func (e *engine[T]) flush(ctx context.Context, pending map[string]struct{}) {
 	if len(pending) == 0 {
 		return
 	}
 	cand, fields, ok := e.buildCandidate()
 	if !ok {
+		return
+	}
+
+	// Gate the candidate before anything observable changes. This runs after
+	// buildCandidate, because validation is pure and cheap and rejects far more
+	// candidates than a live check ever will, and before the version bump, the
+	// history record and the swap, so a network round trip is only ever spent
+	// on a candidate whose shape is already known good and a refusal costs
+	// exactly what a validation failure costs: one OnError delivery, and
+	// nothing else moves.
+	//
+	// It runs on the pinned branch too, on purpose. A pin freezes what Get
+	// returns; it does not stop Live advancing, and Unpin applies the newest
+	// such candidate wholesale without any gating of its own (see handlePin's
+	// unpin case). Gating only while unpinned would make Unpin the one path
+	// that can publish a snapshot nothing ever verified. Note that Old is
+	// therefore the live snapshot this candidate supersedes, which while
+	// pinned is not the one Get is currently serving.
+	//
+	// The rollback is not defensive coding, and it is not removable.
+	// buildCandidate advanced e.applied to the new version for every field in
+	// fields, as a side effect, before returning. Leaving it advanced past a
+	// value that was refused breaks the engine in two ways at once:
+	//
+	// The next flush would diff the rejected version against itself, come up
+	// empty, and return ok == false. The rejected value would never be retried,
+	// no further error would ever be emitted, and Get would serve the
+	// superseded configuration indefinitely. (Status reports the watcher
+	// healthy through a refusal either way: emitErr does not set e.lastErr, so
+	// buildReport sees nothing wrong, exactly as it does not for a validation
+	// failure. What the rollback restores is the retry, and with it an error on
+	// every subsequent attempt; without it even the errors stop, which is what
+	// makes the staleness silent rather than merely undesired.)
+	//
+	// And the refused value is not withdrawn from e.observed, so it stays in
+	// every candidate built afterwards. Hidden from the diff, it rides into the
+	// next unrelated field's flush past a hook written the way PreApply's own
+	// documentation recommends - verify only what Changed - and reaches Get
+	// having been verified by nothing.
+	//
+	// Each FieldChange carries the OldVersion this needs, which is why the diff
+	// itself undoes the mutation rather than a separate copy of the map taken
+	// beforehand. Restoring an OldVersion of "" writes an empty entry where a
+	// field may have had no entry at all; every reader of e.applied compares it
+	// with ==, and a missing key reads as "" too, so the two are
+	// indistinguishable.
+	if err := runPreApply(ctx, e.preApply, e.o.preApplyTimeout, Change[T]{
+		Old:    e.lastGood,
+		New:    cand,
+		Fields: fields,
+	}, &e.w.inPreApply); err != nil {
+		for _, f := range fields {
+			e.applied[f.Path] = f.OldVersion
+		}
+		e.emitErr(err)
 		return
 	}
 

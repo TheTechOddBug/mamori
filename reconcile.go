@@ -35,6 +35,16 @@ type options struct {
 	historyN     int               // snapshots retained beyond the current one; 0 = current only
 	refVars      map[string]string // ${VAR} expansion for source tags; nil means none
 
+	// preApply is the gate run before a candidate snapshot becomes current,
+	// typed per T and stored as any for the same reason onChange below is;
+	// Watch[T] and loadValue (reconcile.go) each assert it back to a concrete
+	// type via the shared typedPreApply[T] helper - loadValue is the only
+	// assertion Load ever gets, since Load has no Watch-side check of its own.
+	// preApplyTimeout bounds it (see WithPreApplyTimeout for why that bound is
+	// mandatory).
+	preApply        any
+	preApplyTimeout time.Duration
+
 	// admin server config, consumed only by Watch (see adminhttp.go). Load
 	// accepts the same Option values but has no watcher to run a server
 	// against, so it ignores all three.
@@ -57,15 +67,16 @@ type options struct {
 // have changed the retry cadence of every existing caller. See WithBackoff.
 func defaultOptions() *options {
 	return &options{
-		providers:    map[string]Provider{},
-		validator:    defaultValidator(),
-		clock:        SystemClock(),
-		pollInterval: defaultPollInterval,
-		jitter:       defaultJitter,
-		debounce:     defaultDebounce,
-		queueDepth:   defaultQueueDepth,
-		meter:        noopMeter{},
-		tracer:       noopTracer{},
+		providers:       map[string]Provider{},
+		validator:       defaultValidator(),
+		clock:           SystemClock(),
+		pollInterval:    defaultPollInterval,
+		jitter:          defaultJitter,
+		debounce:        defaultDebounce,
+		queueDepth:      defaultQueueDepth,
+		meter:           noopMeter{},
+		tracer:          noopTracer{},
+		preApplyTimeout: defaultPreApplyTimeout,
 	}
 }
 
@@ -213,6 +224,19 @@ func Load[T any](ctx context.Context, opts ...Option) (T, error) {
 // detection in Watch).
 func loadValue[T any](ctx context.Context, o *options) (T, []resolved, error) {
 	var cfg T
+
+	// Checked before any provider round trip, for the same reason Watch checks
+	// it before calling loadValue at all (see typedPreApply's doc comment):
+	// a hook typed for the wrong T is a caller bug that should fail loudly and
+	// immediately, not after fields have already been resolved. This duplicates
+	// Watch's own check for the Watch path (harmless: same nil-or-error result
+	// either time), but it is the ONLY check for Load, which has no earlier
+	// point of its own to catch this.
+	hook, err := typedPreApply[T](o)
+	if err != nil {
+		return cfg, nil, err
+	}
+
 	t := reflect.TypeOf(cfg)
 	specs, err := fieldSpecs(t, o.refVars)
 	if err != nil {
@@ -228,6 +252,49 @@ func loadValue[T any](ctx context.Context, o *options) (T, []resolved, error) {
 	if err := o.validator.Validate(cfg); err != nil {
 		return cfg, nil, &ValidationError{Err: err}
 	}
+
+	// Gate the initial configuration too (decision D7): a hook that verifies a
+	// credential should verify the first one, so a credential that does not
+	// work fails at startup (Watch) or on the spot (Load) rather than at the
+	// first rotation. Old is the zero value of T here, since nothing was
+	// serving yet.
+	//
+	// Fields is populated, not left nil, and it is populated by applying the
+	// engine's own diff rule (buildCandidate, reconciler.go) against the true
+	// prior state at this point in time: e.applied does not exist yet (Watch
+	// only seeds it after loadValue returns), so the prior version for every
+	// field is the empty string, and buildCandidate already treats a missing
+	// applied entry and an explicit "" identically (see flush's own comment on
+	// that equivalence). Applying that same rule here yields one FieldChange
+	// per resolved field, each with OldVersion "" - exactly what buildCandidate
+	// would compute one instant later, were e.applied queried before Watch
+	// seeds it. This is what makes ev.Changed(path) true for every field set on
+	// this load, which is what lets a hook written the documented way (guard on
+	// ev.Changed before doing the I/O) verify the initial configuration at all
+	// - the entire point of D7. See TestPreApplyInitialLoadPopulatesFields.
+	//
+	// This is the only place either Load or Watch's initial resolve runs the
+	// gate: Watch stores this call's result directly into the engine's
+	// lastGood/cfg without a further gate of its own (see Watch in
+	// reconciler.go), so gating here costs exactly one hook invocation for the
+	// initial configuration, not two.
+	var fields []FieldChange
+	for _, r := range res {
+		if r.set {
+			fields = append(fields, FieldChange{Path: r.spec.Path, NewVersion: r.value.Version})
+		}
+	}
+	// The reentrancy mark is nil here, and that is not an oversight: this gate
+	// runs on the CALLER's goroutine, inside Load or inside Watch before it has
+	// constructed a Watcher at all. There is no reconciler goroutine yet and no
+	// control channel to send on, so there is nothing a hook could reenter -
+	// a hook reaching for the Watcher this load is producing can only find the
+	// nil it has not been assigned yet. Only flush's gate, which runs on the
+	// reconciler goroutine itself, needs the mark (see reconciler.go).
+	if err := runPreApply(ctx, hook, o.preApplyTimeout, Change[T]{New: cfg, Fields: fields}, nil); err != nil {
+		return cfg, nil, err
+	}
+
 	return cfg, res, nil
 }
 
