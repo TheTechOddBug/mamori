@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.5.0](https://github.com/xavidop/mamori/compare/v1.4.0...v1.5.0) (2026-07-30)
+
+
+### Features
+
+* **cli:** mamori diff, a config-surface and privilege delta for PR review ([#97](https://github.com/xavidop/mamori/issues/97)) ([6caaa58](https://github.com/xavidop/mamori/commit/6caaa581be8827ff3f46153709daf7bbaf44fd35))
+
 # [1.4.0](https://github.com/xavidop/mamori/compare/v1.3.3...v1.4.0) (2026-07-30)
 
 
