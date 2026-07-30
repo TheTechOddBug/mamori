@@ -62,7 +62,27 @@ Rules to hold onto:
   into a payload that only exists once decoded - drop the `#key`, decode the
   whole payload, and use `flatten:"json"` for that case instead. A bad
   payload is a loud `ErrInvalid`, never silently passed through; a field's
-  `default:` value is exempt - it is used as-is, undecoded.
+  `default:` value is exempt - it is used as-is, undecoded. Decoding is done
+  by core in the process that loads the config, so `?decode=` belongs on the
+  `source` tag you write - including a `mamori://name` ref pointing at a
+  config server. A server-side binding may not carry it (`server.New`
+  rejects it), since that server never runs the pipeline.
+- `${VAR}` in a `source` tag is ref interpolation: it expands from the map
+  passed to `mamori.WithRefVars(map[string]string{...})`, once, before the
+  tag is parsed - `source:"aws-sm://${ENV}/db#password"`. **Variables come
+  only from `WithRefVars`, never `os.Getenv` or any other ambient source** -
+  the same opt-in posture as `exec:`/`WithExecProvider`, because a ref
+  decides which secret gets read and that must not be steerable by anything
+  able to set an environment variable. If a variable's value should come
+  from the environment, opt in explicitly and by name with
+  `mamori.WithRefVars(mamori.EnvVars("ENVIRONMENT", "REGION"))` - do not
+  suggest reading `os.Getenv` directly into a ref. A bare `$VAR` (no braces)
+  is untouched and `$$` is a literal `$`. An undefined variable, an
+  unterminated `${`, or an empty `${}` are all hard errors, not a silently
+  empty path segment. `WithRefVars` values must not be secrets: the
+  expanded ref is visible in `Status()`, the admin `Report`, and
+  `mamori doctor` output - use it for environment names, regions, and
+  similar identifiers, never for anything confidential.
 
 ## Watch for live changes
 
