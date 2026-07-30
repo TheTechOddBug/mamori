@@ -2,6 +2,29 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.4.0](https://github.com/xavidop/mamori/compare/v1.3.3...v1.4.0) (2026-07-30)
+
+
+### Bug Fixes
+
+* let an exec: argument contain a space, and document env vars ([#74](https://github.com/xavidop/mamori/issues/74)) ([d38bd40](https://github.com/xavidop/mamori/commit/d38bd403418457c73e812bd7e1d1f32d8ac3de06))
+
+
+### Features
+
+* ?decode= value transforms ([#57](https://github.com/xavidop/mamori/issues/57)) ([63571f8](https://github.com/xavidop/mamori/commit/63571f8e85f7175636a08f0214196270d464db2c)), closes [#56](https://github.com/xavidop/mamori/issues/56)
+* ${VAR} ref interpolation via WithRefVars ([#60](https://github.com/xavidop/mamori/issues/60)) ([43ed2e8](https://github.com/xavidop/mamori/commit/43ed2e88533f1e90cab6cf6cf76c34ff0cf2cb76))
+* **aws:** aws-appconfig provider ([#66](https://github.com/xavidop/mamori/issues/66)) ([2c68e40](https://github.com/xavidop/mamori/commit/2c68e400daa0a91be5179f98e7d513bbddc80a56))
+* **azure:** azure-appconfig provider ([#67](https://github.com/xavidop/mamori/issues/67)) ([c109c58](https://github.com/xavidop/mamori/commit/c109c58e4e5a67d2f63c35b31c1db7fafd5b2d99))
+* Meter counters for stale, dropped and rejected, plus the x/prom bridge ([#73](https://github.com/xavidop/mamori/issues/73)) ([2d1383e](https://github.com/xavidop/mamori/commit/2d1383e15d4d983cfe4e582787408e2d1aca1418)), closes [#key](https://github.com/xavidop/mamori/issues/key)
+* **openfeature:** openfeature provider ([#68](https://github.com/xavidop/mamori/issues/68)) ([f025615](https://github.com/xavidop/mamori/commit/f0256155ff0c7493e8849e19775f6fa3bd09b233))
+* PreApply gate for rotation safety ([#61](https://github.com/xavidop/mamori/issues/61)) ([4ddbff2](https://github.com/xavidop/mamori/commit/4ddbff23adb98b85897eac3586d2604094ea32d9))
+* Refresh forces an immediate re-resolve ([#62](https://github.com/xavidop/mamori/issues/62)) ([74edb00](https://github.com/xavidop/mamori/commit/74edb00d35ce95b7171b1891e996ff651304eaa1))
+* RFC 6901 JSON Pointer nested key selection ([#53](https://github.com/xavidop/mamori/issues/53)) ([33bcdb8](https://github.com/xavidop/mamori/commit/33bcdb8b94118d2b167651e1a6393f196ab9df14)), closes [#fragment](https://github.com/xavidop/mamori/issues/fragment) [#value](https://github.com/xavidop/mamori/issues/value) [#fragment](https://github.com/xavidop/mamori/issues/fragment) [#fragment](https://github.com/xavidop/mamori/issues/fragment) [#value](https://github.com/xavidop/mamori/issues/value)
+* **secret:** add Clone, and stop Zero's doc recommending corruption ([#72](https://github.com/xavidop/mamori/issues/72)) ([a07d508](https://github.com/xavidop/mamori/commit/a07d5083fe235ae09ab9946d0d58a256fbfbb31a))
+* structured engine logging via WithLogger ([#70](https://github.com/xavidop/mamori/issues/70)) ([c97fe2e](https://github.com/xavidop/mamori/commit/c97fe2e0a076ffd4e50421367d93d33dcd7336b5))
+* **viper:** viper provider ([#69](https://github.com/xavidop/mamori/issues/69)) ([8413a62](https://github.com/xavidop/mamori/commit/8413a6285293084827f245ae587e490131f3ac3a))
+
 ## [1.3.3](https://github.com/xavidop/mamori/compare/v1.3.2...v1.3.3) (2026-07-29)
 
 
