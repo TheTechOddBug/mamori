@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+## [1.6.2](https://github.com/xavidop/mamori/compare/v1.6.1...v1.6.2) (2026-08-01)
+
+
+### Bug Fixes
+
+* **providers:** bound and drain HTTP error bodies, and pin the guards that were unpinned ([#115](https://github.com/xavidop/mamori/issues/115)) ([1790952](https://github.com/xavidop/mamori/commit/179095248b4ce39d254519883a18d135a96d7492)), closes [#103](https://github.com/xavidop/mamori/issues/103) [#104](https://github.com/xavidop/mamori/issues/104)
+
 ## [1.6.1](https://github.com/xavidop/mamori/compare/v1.6.0...v1.6.1) (2026-08-01)
 
 
