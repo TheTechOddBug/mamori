@@ -1,5 +1,7 @@
 package mamori
 
+import "reflect"
+
 // buildReport constructs an immutable Report from the engine's current state.
 // It is called only by the reconciler goroutine, so it reads the engine maps
 // without locking: they are never written by any other goroutine. Age and
@@ -46,6 +48,58 @@ func (e *engine[T]) buildReport() *Report {
 		}
 		fields = append(fields, fs)
 	}
+	// Derived entries carry no fieldSpec at all - a WithDerive hook writes an
+	// opaque field, not one fieldSpecs (decode.go) ever discovers walking the
+	// struct - so nothing in the loop above ever visits them. Append one per
+	// declared write path here instead, after every sourced field; see
+	// Report's own doc comment for what this does to the "struct declaration
+	// order" property, and fieldUnhealthy's doc comment below for why a
+	// Watcher.Status derived entry can never be unhealthy while a Doctor row
+	// for the same path can be.
+	//
+	// Three gates below, each preventing a specific bad row:
+	//
+	// hasSpecPath skips a declared path that ALSO names a real fieldSpec.
+	// That path already got a full FieldStatus above, and a second
+	// Derived-flavored entry would publish two rows for one field to
+	// Status(), the admin body, and the CLI table. derivedFieldChanges
+	// uses the same helper, so the two can never disagree.
+	//
+	// fieldByPath, queried against e.lastGood, gates the append on the path
+	// resolving to a readable field. A declared path is validated for SHAPE
+	// only at Load/Watch time, so a typo like "DSNN" is expected input here,
+	// not a bug, and must not publish a phantom row to the admin endpoint.
+	// CanInterface is checked too: FieldByName matches an unexported field
+	// just as readily, and Interface() on that panics.
+	//
+	// Sensitive comes from the field's own reflect.Type, the same comparison
+	// walkSpecs uses for a sourced field, so a derived field assigned into a
+	// secret.String gets the same true in a CLI's SENSITIVE column. No value
+	// is published either way; this is one bool.
+	lastGood := reflect.ValueOf(e.lastGood)
+	seenDerived := make(map[string]struct{})
+	for _, d := range e.derives {
+		for _, p := range d.writes {
+			if _, dup := seenDerived[p]; dup {
+				continue
+			}
+			seenDerived[p] = struct{}{}
+			if hasSpecPath(e.specs, p) {
+				continue
+			}
+			v, ok := fieldByPath(lastGood, p)
+			if !ok || !v.CanInterface() {
+				continue
+			}
+			sensitive := v.Type() == secretStringType || v.Type() == secretBytesType
+			fields = append(fields, FieldStatus{
+				Path:      p,
+				Derived:   true,
+				Sensitive: sensitive,
+				Version:   derivedVersion(v),
+			})
+		}
+	}
 	// served is the version Get actually returns: the pinned version while
 	// pinned (Snapshot freezes there even as Live keeps climbing), otherwise
 	// the same as Live.
@@ -64,12 +118,26 @@ func (e *engine[T]) buildReport() *Report {
 }
 
 // fieldUnhealthy is the single source of truth for what makes one field
-// unhealthy, shared by buildReport, Status, and Health (and Doctor, later).
+// unhealthy, shared by buildReport, Status, Health, and Doctor.
 // KindNotFound, KindPermissionDenied, KindUnauthenticated, and KindInvalid are
 // terminal: they will not clear without human action, so a field carrying one
 // is unhealthy immediately. Everything else (including no error at all) is
 // judged only by staleness, since KindUnavailable and KindRateLimited are
 // expected to self-heal on the next successful resolve.
+//
+// A Derived field is judged by the same rules. It has no ref and no staleness
+// clock, so LastKind and Stale are zero for it in a Watcher.Status report and
+// it cannot go unhealthy there: a hook that fails rejects the whole candidate
+// in buildCandidate, so a published config never contains a failed derive. A
+// Doctor probe is the case this matters for - it evaluates the hooks directly
+// (see doctorDerivedFields, doctor.go) and marks KindInvalid both a hook that
+// ran and failed and a set of hooks that cannot be typed to T at all (which
+// fails Load and Watch outright), either of which must count.
+//
+// A Doctor row for a derive the hooks never got to evaluate, because a sourced
+// field produced no value to feed them, deliberately carries no LastKind: it
+// reports that nothing was computed without double-counting the source field
+// that is already reporting its own failure.
 func fieldUnhealthy(fs FieldStatus) bool {
 	switch fs.LastKind {
 	case KindNotFound, KindPermissionDenied, KindUnauthenticated, KindInvalid:

@@ -52,8 +52,9 @@ Causes:
 
 - The candidate failed the configured `Validator`.
 - A `PreApply` gate rejected it (the credential the candidate carries does not actually work).
+- A `WithDerive` hook returned an error (a value assembled from other fields could not be built).
 
-Diagnostics: `OnError` receives a `*ValidationError` for the first case and a `*PreApplyError` for the second, so `errors.As` tells them apart:
+Diagnostics: `OnError` receives a `*ValidationError` for the first case, a `*PreApplyError` for the second, and a `*DeriveError` for the third, so `errors.As` tells them apart:
 
 ```go
 mamori.OnError(func(err error) {
@@ -65,11 +66,16 @@ mamori.OnError(func(err error) {
 	var verr *mamori.ValidationError
 	if errors.As(err, &verr) {
 		// the candidate failed struct validation
+		return
+	}
+	var derr *mamori.DeriveError
+	if errors.As(err, &derr) {
+		// a WithDerive hook returned an error
 	}
 })
 ```
 
-`Meter.RecordApplyRejected(reason)` reports which one happened as a `RejectReason`, a closed type with exactly two values, `RejectValidation` and `RejectPreApply`, so it is safe to use directly as a metric label. See [Rotation safety](/docs/usage/rotation/) for why `PreApply` exists and what a rejection does to `Get()` and `OnChange`.
+`Meter.RecordApplyRejected(reason)` reports which one happened as a `RejectReason`, a closed type with exactly three values, `RejectValidation`, `RejectPreApply`, and `RejectDerive` (a `WithDerive` hook returned an error), so it is safe to use directly as a metric label. See [Rotation safety](/docs/usage/rotation/) for why `PreApply` exists and what a rejection does to `Get()` and `OnChange`.
 
 ## My process will not start
 
@@ -77,7 +83,7 @@ mamori.OnError(func(err error) {
 
 Diagnostics:
 
-- `mamori.Doctor[T](ctx, opts...)` resolves every field once and reports every failing ref at once, rather than stopping at the first, so you see the whole list of what is unreachable in a single run. Run it as a preflight check before you ever call `Watch` or `Load` for real.
+- `mamori.Doctor[T](ctx, opts...)` resolves every `source`-tagged field once and reports every failing ref at once, rather than stopping at the first, so you see the whole list of what is unreachable in a single run. Run it as a preflight check before you ever call `Watch` or `Load` for real. It also runs every registered [`WithDerive`](/docs/usage/derived-fields/) hook, so a derive that would fail at startup fails this preflight too.
 - Look at the error kind. mamori splits resolve failures into terminal kinds (`not_found`, `permission_denied`, `unauthenticated`, `invalid`), which will not clear without a human fixing something, and transient kinds (`unavailable`, `rate_limited`), which are expected to self-heal on a later attempt. A terminal kind at startup usually means a wrong ref or a missing grant; a transient one usually means the backend was not up yet.
 - If a field legitimately should not block startup, say so explicitly: tag it `optional:"true"` if its absence is fine, or give it an `onfail:` tag (`onfail:"default"` to fall back to its `default:` value on error, or the reconciler's own `onfail:"keeplast"`/`onfail:"fail"` policies for the watch path) rather than letting an unrelated field's outage take down the whole process.
 

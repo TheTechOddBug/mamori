@@ -60,17 +60,49 @@
           "Addr",
           "Password"
         ]
+      },
+      "Computed": {
+        "type": "string"
+      },
+      "Nested": {
+        "type": "object",
+        "properties": {
+          "Addr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "Addr"
+        ]
+      },
+      "DSN": {
+        "type": "string"
       }
     },
     "required": [
       "APIKey",
+      "Computed",
       "DBHost",
+      "DSN",
       "GCPSecret",
       "Level",
       "LogLevel",
       "Region",
       "RequestTimeout",
       "ServiceName"
+    ]
+  },
+  {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "example.com/fixture.TaggedNest",
+    "type": "object",
+    "properties": {
+      "Addr": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "Addr"
     ]
   },
   {
@@ -105,6 +137,41 @@
     },
     "required": [
       "Host"
+    ]
+  },
+  {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "example.com/fixture.IncompleteConfig",
+    "type": "object",
+    "properties": {
+      "Name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "Name"
+    ]
+  },
+  {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "example.com/fixture.DeriveOverlap",
+    "type": "object",
+    "properties": {
+      "Port": {
+        "type": "string",
+        "default": "8080"
+      },
+      "DSN": {
+        "type": "string",
+        "minLength": 10
+      },
+      "Derived": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "DSN",
+      "Derived"
     ]
   }
 ]

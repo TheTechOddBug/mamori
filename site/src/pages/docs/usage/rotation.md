@@ -44,6 +44,36 @@ w, err := mamori.Watch[Config](ctx,
 Keep the `ev.Changed` guard. Without it the hook re-pings the database every
 time an unrelated field changes, such as a log level.
 
+## Proving a value assembled from several fields
+
+`PreApply` proves whatever `ev.New` holds at the moment it runs. If a field on `ev.New` is a plain local you assemble yourself after `Get()` - a DSN built from a host, a user, and a password - it was built once, at wiring time, and `PreApply` never sees it rebuilt; see [Derived fields](/docs/usage/derived-fields/) for that failure in full.
+
+[`WithDerive`](/docs/usage/derived-fields/) installs a hook that rebuilds such a field on every applied update, before `PreApply` runs:
+
+```go
+w, err := mamori.Watch[Config](ctx,
+	mamori.WithDerive(func(c *Config) error {
+		c.DSN = secret.NewString((&url.URL{
+			Scheme: "postgres",
+			User:   url.UserPassword(c.User, c.Pass.Reveal()),
+			Host:   c.Host,
+			Path:   "/app",
+		}).String())
+		return nil
+	}, "DSN"),
+	mamori.PreApply(func(ctx context.Context, ev mamori.Change[Config]) error {
+		if !ev.Changed("DSN") {
+			return nil
+		}
+		return pool.Ping(ctx, ev.New.DSN.Reveal())
+	}),
+)
+```
+
+`WithDerive` and `PreApply` together are what make a rotated credential both **rebuilt** and **proven**: the derive reassembles the DSN from the new password, and because it runs first, `PreApply` proves the rebuilt DSN rather than the one it replaced. Without the derive, `PreApply` would still be gated correctly, just against a DSN nobody ever rebuilt.
+
+The guard checks `ev.Changed("DSN")` rather than `ev.Changed("Pass")` because `WithDerive` declares `"DSN"` as a write above: a declared derive write is reported changed exactly when its rebuilt value differs, so the guard can name the field it actually cares about instead of enumerating every input (`Pass`, `Host`, `User`) that could have moved it.
+
 ## What a rejection does
 
 - `Get()` keeps returning the last valid config.
@@ -75,17 +105,17 @@ swap. `Pin`, `PinCurrent`, `Unpin`, and `Refresh` are commands serviced by that
 same goroutine, so calling one from inside the hook asks it to answer while it
 is busy being your hook.
 
-**This applies to `OnError` too, and that is the one people hit**, because
-"the reload was rejected, retry it" is a natural thing to write there. mamori
-refuses the call rather than hanging:
+**This applies to `OnError` and `WithDerive` too, and `OnError` is the one
+people hit most often**, because "the reload was rejected, retry it" is a
+natural thing to write there. mamori refuses the call rather than hanging:
 
-| Called from inside `PreApply` or `OnError` | Result |
+| Called from inside `PreApply`, `WithDerive`, or `OnError` | Result |
 | --- | --- |
-| `Get()` | Works. The supported way to read from either. |
+| `Get()` | Works. The supported way to read from any of them. |
 | `Pin(v)` | `ErrReentrantCall`. Nothing is pinned. |
 | `PinCurrent()` | Returns `0`, which never collides with a real version. Nothing is pinned. |
 | `Unpin()` | Does nothing. It has no error to return. |
-| `Refresh(ctx)` | `ErrReentrantCall`. Nothing is re-resolved, whatever `ctx` you pass. |
+| `Refresh(ctx)` | `ErrReentrantCall`. Nothing is re-resolved, whatever `ctx` you pass. A `WithDerive` hook has no `ctx` argument at all, so it never had that escape to begin with. |
 
 `OnChange` is the exception and is safe: it runs on its own goroutine, so all
 of these work normally from there.
@@ -143,6 +173,7 @@ here: it is the smallest window covering the overlap.
 
 ## See also
 
+- [Derived fields](/docs/usage/derived-fields/) - `WithDerive`, so a value assembled from several fields survives a rotation too.
 - [Forcing a refresh](/docs/usage/refresh/) - `Refresh`, which `PreApply` gates too.
 - [Watch for changes](/docs/usage/watching/) - `Watch`, `Get`, `OnChange`, `OnError`.
 - [Snapshots and pinning](/docs/usage/snapshots/) - `WithHistory` and pinning.

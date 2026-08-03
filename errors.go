@@ -26,37 +26,72 @@ var ErrNoSuchSnapshot = errors.New("mamori: no such snapshot version")
 // unambiguous from the fact that Close was called.
 var errWatcherClosed = errors.New("mamori: watcher closed")
 
+// reentrantCallbacks names, in exactly one place, every callback this package
+// runs INLINE on the reconciler goroutine: runPreApply's PreApply hook
+// (preapply.go), buildCandidate's derive loop, and emitErr's OnError
+// (reconciler.go, both). ErrReentrantCall's message below is built from this
+// list rather than carrying its own copy of the enumeration, and
+// TestArmReentrancyCallSitesMatchReentrantCallbacks
+// (reentrancy_sites_test.go) checks it against the real armReentrancy call
+// sites in the source.
+//
+// This list exists because WithDerive joined PreApply and OnError as a third
+// inline callback, and seven review rounds in a row afterward each found a
+// comment or a doc page that still enumerated two - every round fixed the
+// instance it was shown and missed the others, because prose has nothing
+// tying it back to the code. Routing the message through this list does not
+// make a doc COMMENT or a markdown page self-updating; it only removes one of
+// the places the count could be restated wrong. See the test above for what
+// it does and does not catch.
+//
+// A future callback this package runs inline on the reconciler goroutine
+// belongs here: add its name, arm armReentrancy (preapply.go) around it, and
+// let the test catch a mismatch between the two.
+var reentrantCallbacks = []string{"a PreApply hook", "a WithDerive hook", "an OnError callback"}
+
+// joinCallbackList renders a list of callback names (reentrantCallbacks, in
+// practice) as the English enumeration ErrReentrantCall's message ends in: "X"
+// alone, "X or Y" for two, and "X, Y, or Z" (an Oxford comma before the final
+// "or") for three or more - the exact shape today's three-item list already
+// needed, so a fourth entry keeps reading naturally instead of running the
+// last two together.
+func joinCallbackList(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " or " + items[1]
+	default:
+		return strings.Join(items[:len(items)-1], ", ") + ", or " + items[len(items)-1]
+	}
+}
+
 // ErrReentrantCall reports a control-channel command issued from the goroutine
 // that is currently running one of the watcher's own callbacks.
 //
-// Two callbacks run ON the reconciler goroutine, inline: a PreApply hook, and an
-// OnError callback (OnChange does not - it is delivered from the dispatch queue,
-// on its own goroutine, and is unaffected by any of this). Pin, PinCurrent,
-// Unpin and Refresh are commands SERVICED by the reconciler goroutine. Calling
-// one from inside either callback asks that goroutine to answer a message it
-// cannot reach until the callback it is running returns: before this was
-// detected, it blocked until Close, with no reconciliation, no OnChange and no
-// further OnError in the meantime. This sentinel converts that permanent, silent
-// wedge into an immediate, diagnosable refusal that leaves pin state, and the
-// configuration, untouched.
+// The callbacks that run ON the reconciler goroutine, inline, are named by
+// reentrantCallbacks above (OnChange does not join them - it is delivered from
+// the dispatch queue, on its own goroutine, and is unaffected by any of this).
+// Pin, PinCurrent, Unpin and Refresh are commands SERVICED by the reconciler
+// goroutine. Calling one from inside an inline callback asks that goroutine to
+// answer a message it cannot reach until the callback returns, which would
+// wedge the watcher silently until Close. This sentinel makes that an immediate,
+// diagnosable refusal that leaves pin state and the configuration untouched.
 //
-// Three of the four commands take no context at all, so they had no way out to
-// begin with. Refresh does take one, and is refused just the same: a context
-// makes the wedge escapable, not absent, and the obvious call to write inside a
-// callback is Refresh(context.Background()), which has no deadline to escape on
-// either.
+// Refresh is refused too, despite taking a context: a context makes the wedge
+// escapable, not absent, and the obvious call to write inside a callback is
+// Refresh(context.Background()), which has no deadline anyway.
 //
 // The refusal is keyed on WHICH goroutine is inside the callback, not merely
-// that one is, so a command issued from any other goroutine - including one that
-// happens to overlap a running callback - queues on the control channel and is
-// serviced normally, exactly as it always was.
+// that one is, so a command from any other goroutine, including one overlapping
+// a running callback, queues and is serviced normally.
 //
-// Unlike errWatcherClosed it is exported, because the two errors sit at
-// opposite ends of what a caller can do about them: a closed watcher is an
-// expected lifecycle race with Close and needs no test, while this one is a
-// programming mistake in the caller's own callback, and a test that wants to
-// prove the mistake is caught (or a wrapper that wants to translate it) needs
-// errors.Is to reach it.
+// It is exported, unlike errWatcherClosed, because a closed watcher is an
+// expected lifecycle race while this is a programming mistake in the caller's
+// own callback: a test proving the mistake is caught, or a wrapper translating
+// it, needs errors.Is to reach it.
 //
 // Pin and Refresh return it directly. PinCurrent returns version 0 and Unpin
 // does nothing; see their doc comments for why, and for what each leaves
@@ -64,10 +99,11 @@ var errWatcherClosed = errors.New("mamori: watcher closed")
 //
 // Two kinds of addition belong here rather than beside it. A future command
 // serviced by the reconciler goroutine: route it through sendPinCtx's guard
-// (pin.go). A future callback this package runs inline on that goroutine: arm
-// armReentrancy (preapply.go) around it, as emitErr does. Either one left out
-// is a wedge that this sentinel's own wording promises does not exist.
-var ErrReentrantCall = errors.New("mamori: Pin, PinCurrent, Unpin and Refresh cannot be called from the goroutine running a PreApply hook or an OnError callback, which occupies the reconciler goroutine that services them; Get is safe there, but these must be called from another goroutine")
+// (pin.go). A future callback this package runs inline on that goroutine: add
+// it to reentrantCallbacks above and arm armReentrancy (preapply.go) around
+// it, as emitErr does. Either one left out is a wedge that this sentinel's own
+// wording promises does not exist.
+var ErrReentrantCall = errors.New("mamori: Pin, PinCurrent, Unpin and Refresh cannot be called from the goroutine running " + joinCallbackList(reentrantCallbacks) + ", which occupies the reconciler goroutine that services them; Get is safe there, but these must be called from another goroutine")
 
 // Kind is a coarse, provider-independent classification of a resolve failure.
 // It exists so diagnostics can distinguish conditions that need human action
@@ -226,6 +262,25 @@ func (e *ValidationError) Error() string {
 }
 
 func (e *ValidationError) Unwrap() error { return e.Err }
+
+// DeriveError is delivered to OnError when a WithDerive hook returns an error,
+// and returned by Watch and Load when the failure happens on the initial
+// resolve. The update is rejected atomically, exactly as a validation failure
+// is, and Get continues to return the last valid config.
+//
+// Rejecting rather than continuing is deliberate: a configuration whose derived
+// fields were not built is not one anyone should serve, and half-applying it
+// would produce a snapshot where some fields reflect a rotated credential and a
+// value derived from them still reflects the old one.
+type DeriveError struct {
+	Err error
+}
+
+func (e *DeriveError) Error() string {
+	return fmt.Sprintf("mamori: derive failed: %v", e.Err)
+}
+
+func (e *DeriveError) Unwrap() error { return e.Err }
 
 // StaleError is returned/delivered when a value has exceeded the configured
 // WithStale max age without a successful refresh.

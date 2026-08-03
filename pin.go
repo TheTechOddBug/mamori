@@ -57,46 +57,35 @@ type pinReply struct {
 // sendPin delivers cmd to the reconciler goroutine and blocks for its reply.
 // It never blocks forever, even when the reconciler goroutine has already
 // exited or is mid-shutdown by the time this call is made, because it also
-// selects on <-w.ctx.Done(): the reconciler goroutine's loop (see
-// engine.loop) returns as soon as w.ctx is done, whether that is because
-// Close cancelled it or because the PARENT context passed to Watch was
-// cancelled independently of Close. w.ctx.Done() closes synchronously as
-// part of the cancel call itself (a context.CancelFunc does not return
-// until its Done channel is already closed), so a sendPin call blocked on
-// control, or one made after the fact, unblocks here in both shutdown paths,
-// not just the Close one, and returns errWatcherClosed: from the caller's
-// perspective, "the reconciler is gone" reads the same regardless of which
-// path caused it.
+// selects on <-w.ctx.Done(). The reconciler's loop returns as soon as w.ctx is
+// done, whether Close cancelled it or the PARENT context passed to Watch was
+// cancelled independently, and Done closes synchronously as part of the cancel.
+// So a sendPin blocked on control, or made after the fact, unblocks in both
+// shutdown paths and returns errWatcherClosed.
 //
-// There is one way to block on control forever that ctx.Done cannot rescue, and
-// the guard below is it: one of the watcher's own inline callbacks calling back
-// into that watcher. Two of them run ON the reconciler goroutine - a PreApply
-// hook (see preapply.go) and an OnError callback (emitErr, reconciler.go) - so
-// while either runs there is no receiver for control at all, and the caller
-// waiting for one IS the goroutine that would have to become that receiver.
-// Nothing short of Close ever resolves it, and until then the watcher does not
-// reconcile, does not deliver OnChange and does not report an error - a silent,
-// permanent wedge. So this refuses the command instead, and w.inCallback is what
-// makes the refusal precise: it holds the ID of the goroutine currently inside
-// such a callback, so only a caller that is genuinely waiting on itself is
-// turned away. A pin command from any other goroutine, including one issued
-// while a callback happens to be running, still queues on control and is
-// serviced when the reconciler comes back to its select, exactly as it always
-// was. OnChange is not covered, and needs not to be: it runs on the dispatch
-// goroutine, so a command issued from it is an ordinary command.
+// One way to block forever ctx.Done cannot rescue, and the guard below is it:
+// one of the watcher's own inline callbacks calling back into that watcher.
+// Three run ON the reconciler goroutine - a PreApply hook (preapply.go), a
+// WithDerive hook (buildCandidate, reconciler.go), and an OnError callback
+// (emitErr, reconciler.go) - so while any runs there is no receiver for control
+// at all, and the caller waiting for one IS the goroutine that would become it.
+// Nothing short of Close resolves that, so this refuses the command instead.
 //
-// The check is one atomic load on the path that matters: inCallback is zero
-// whenever no such callback is running, which for a watcher with neither a
-// PreApply gate nor an OnError callback is always, and the goroutine-ID lookup
-// is reached only when a pin command truly overlaps one.
+// w.inCallback makes the refusal precise: it holds the ID of the goroutine
+// currently inside such a callback, so only a caller genuinely waiting on
+// itself is turned away. A command from any other goroutine, including one
+// overlapping a running callback, still queues and is serviced normally.
+// OnChange is not covered and need not be: it runs on the dispatch goroutine.
 //
-// Pin, PinCurrent and Unpin take no context, so this is the whole of their
-// delivery. Refresh does take one, and goes through sendPinCtx below rather
-// than around it: the guard above, the errWatcherClosed answer and the
-// single-control-channel discipline are exactly what it needs too, and a second
-// send path would have had to re-derive all three (and, on the evidence of the
-// reentrancy bug this guard exists for, would have re-derived one of them
-// wrong).
+// The check is one atomic load in the common case: inCallback is zero whenever
+// no such callback is running, which for a watcher with no PreApply gate,
+// derive hook, or OnError callback is always. See goroutineID (preapply.go)
+// for the cost of the rarer path, where a command does overlap one.
+//
+// Pin, PinCurrent, and Unpin take no context, so this is the whole of their
+// delivery. Refresh takes one and goes through sendPinCtx below rather than
+// around it, since the guard, the errWatcherClosed answer, and the
+// single-control-channel discipline are exactly what it needs too.
 func (w *Watcher[T]) sendPin(cmd pinCmd) pinReply {
 	// context.Background() is never cancelled, so both ctx.Done() branches
 	// below are receives on a nil channel, which select can never choose. This
@@ -120,18 +109,18 @@ func (w *Watcher[T]) sendPin(cmd pinCmd) pinReply {
 // The reply wait needs w.ctx.Done() as well, and needs it BECAUSE of Refresh.
 // For the three pin commands a reply is guaranteed once the command is
 // delivered - handlePin's other cases run no user code, they are a handful of
-// map writes - which is why the wait was an unconditional receive for as long as
-// those were the only commands. They can still take this branch, but only by
-// racing Close closely enough that the drain below finds nothing, and
-// errWatcherClosed is already the documented answer for a pin that raced Close.
+// map writes. They can still take this branch, but only by racing Close
+// closely enough that the drain below finds nothing, and errWatcherClosed is
+// already the documented answer for a pin that raced Close.
 // The refresh case is the one that needs the branch to exist at all. It runs
-// providers, emitErr and the PreApply hook on the reconciler goroutine, inside
-// handlePin, so "the handler never returns" became reachable for the first time
-// - a hook (or an OnError callback) calling t.Fatal, or anything else reaching
-// runtime.Goexit, kills the reconciler goroutine mid-handler with the reply
-// unsent. Without this branch the caller then outlives Close: the watcher shuts
-// down cleanly, Close returns, and Refresh is still parked on a channel nobody
-// will ever write to. See TestRefreshOutlivesAReconcilerThatDiesMidHandler.
+// providers, emitErr, the PreApply hook and any derive hooks on the reconciler
+// goroutine, inside handlePin, so "the handler never returns" became reachable
+// for the first time - a hook (or an OnError callback) calling t.Fatal, or
+// anything else reaching runtime.Goexit, kills the reconciler goroutine
+// mid-handler with the reply unsent. Without this branch the caller then
+// outlives Close: the watcher shuts down cleanly, Close returns, and Refresh
+// is still parked on a channel nobody will ever write to. See
+// TestRefreshOutlivesAReconcilerThatDiesMidHandler.
 //
 // The drain is what keeps that branch from lying. cmd.reply and w.ctx.Done()
 // can both be ready at once - a refresh that completed in the same instant Close
@@ -174,8 +163,9 @@ func (w *Watcher[T]) sendPinCtx(ctx context.Context, cmd pinCmd) pinReply {
 // pin further back.
 //
 // It returns ErrReentrantCall, immediately and without pinning anything, when
-// called from inside a PreApply hook or an OnError callback: either one occupies
-// the goroutine that would service this command. Call it from another goroutine.
+// called from inside a PreApply hook, a WithDerive hook, or an OnError
+// callback: any of the three occupies the goroutine that would service this
+// command. Call it from another goroutine.
 func (w *Watcher[T]) Pin(version uint64) error {
 	return w.sendPin(pinCmd{kind: pinAt, version: version}).err
 }
@@ -186,10 +176,10 @@ func (w *Watcher[T]) Pin(version uint64) error {
 // one up in it.
 //
 // It returns 0, pinning nothing, in the two cases where it cannot succeed: the
-// watcher is closed, or it was called from inside a PreApply hook or an OnError
-// callback (see ErrReentrantCall - the signature has no room for one, and
-// widening it would break every caller). Zero is unambiguous rather than a
-// convenient lie:
+// watcher is closed, or it was called from inside a PreApply hook, a
+// WithDerive hook, or an OnError callback (see ErrReentrantCall - the
+// signature has no room for one, and widening it would break every caller).
+// Zero is unambiguous rather than a convenient lie:
 // versions start at 1, so it can never collide with a version this really
 // pinned, which is the same disambiguation Pinned relies on. Callers that need
 // to distinguish the two causes, or to be sure at all, can check Pinned.
@@ -203,12 +193,12 @@ func (w *Watcher[T]) PinCurrent() uint64 {
 // many updates were reconciled (and recorded to history) in the meantime. It
 // is a no-op if the watcher is not currently pinned.
 //
-// It is also a no-op when called from inside a PreApply hook or an OnError
-// callback (see ErrReentrantCall): it returns immediately and leaves the pin
-// exactly as it found it, so the watcher stays pinned and Pinned still says so.
-// It reports
-// nothing, because it has nothing to report it with. Giving it an error return
-// would be an incompatible change to a released API - it breaks every func()
+// It is also a no-op when called from inside a PreApply hook, a WithDerive
+// hook, or an OnError callback (see ErrReentrantCall): it returns immediately
+// and leaves the pin exactly as it found it, so the watcher stays pinned and
+// Pinned still says so. It reports nothing, because it has nothing to report
+// it with. Giving it an error return would be an incompatible change to a
+// released API - it breaks every func()
 // this method value is assigned to, t.Cleanup(w.Unpin) among them, and turns
 // every existing call site into an unchecked-error lint finding - which is too
 // much to charge every correct caller for a signal only an incorrect one can

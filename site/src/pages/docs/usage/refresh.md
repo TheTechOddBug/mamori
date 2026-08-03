@@ -35,12 +35,12 @@ for range sighup {
 
 ```mermaid
 flowchart TD
-  R["w.Refresh(ctx)"] --> Q{"Called from inside your own<br/>PreApply hook or OnError callback?"}
+  R["w.Refresh(ctx)"] --> Q{"Called from inside your own<br/>PreApply hook, WithDerive hook,<br/>or OnError callback?"}
   Q -->|yes| RE["ErrReentrantCall<br/>nothing re-resolved"]
   Q -->|no| W["Re-resolve every field"]
   W --> C{"Anything changed?"}
   C -->|no| NIL["nil - Get() was already current"]
-  C -->|yes| G{"Validation and PreApply"}
+  C -->|yes| G{"Derive, validation, and PreApply"}
   G -->|accepted| OK["nil - snapshot applied"]
   G -->|rejected| REJ["The rejection reason<br/>Get() keeps the previous config"]
   W --> X{"You cancelled ctx<br/>while waiting?"}
@@ -55,6 +55,7 @@ them deliberately:
 
 **A rejection**, which is what you usually want to report:
 
+- a `WithDerive` hook returned an error (a `*DeriveError`),
 - a field failed validation,
 - `PreApply` rejected the candidate (a `*PreApplyError`),
 - a field is blocked by `onfail:"fail"` and stayed blocked.
@@ -93,12 +94,12 @@ A forced refresh is gated exactly like any other reconciliation. Skipping the
 gate on the one call an operator reaches for right after a rotation, when a
 gate matters most, would defeat having one.
 
-**Do not call `Refresh` from inside a `PreApply` hook or an `OnError`
-callback.** Both run on the reconciler goroutine, which is the goroutine that
-would have to service the refresh, so it returns `ErrReentrantCall`
-immediately rather than hanging. Giving it a fresh `context.Background()` does
-not help; that would simply block until `Close`. Refresh from another
-goroutine, or let the next reconciliation carry it. See
+**Do not call `Refresh` from inside a `PreApply` hook, a `WithDerive` hook, or
+an `OnError` callback.** All three run on the reconciler goroutine, which is
+the goroutine that would have to service the refresh, so it returns
+`ErrReentrantCall` immediately rather than hanging. Giving it a fresh
+`context.Background()` does not help; that would simply block until `Close`.
+Refresh from another goroutine, or let the next reconciliation carry it. See
 [Do not call back into the same Watcher](/docs/usage/rotation/#do-not-call-back-into-the-same-watcher).
 
 ## While pinned

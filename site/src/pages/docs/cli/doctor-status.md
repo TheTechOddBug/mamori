@@ -20,15 +20,18 @@ mamori doctor --endpoint <ep> [--insecure] [--json] [--compare "<patterns>"]
 
 ```bash
 $ mamori doctor --endpoint https://svc.internal:9090 --compare ./...
-PATH            SCHEME  REF                     VERSION  STALE  LAST_KIND  LAST_ERROR  SENSITIVE
-Redis.Addr      env     env://REDIS_ADDR        3        false  -          -           false
-Redis.Password  aws-sm  aws-sm://prod/redis-pw  3        false  -          -           true
+PATH            SCHEME  REF                     VERSION   STALE  LAST_KIND  LAST_ERROR  SENSITIVE  DERIVED
+Redis.Addr      env     env://REDIS_ADDR        3         false  -          -           false      false
+Redis.Password  aws-sm  aws-sm://prod/redis-pw  3         false  -          -           true       false
+DSN                                             a3f9c1e2  false  -          -           true       true
 
-HEALTHY: 2 field(s), snapshot 3 (live 3), generated 2026-07-26T10:00:00Z
+HEALTHY: 3 field(s), snapshot 3 (live 3), generated 2026-07-26T10:00:00Z
 
 compare: source vs. live field paths
   no drift: source and live field sets match
 ```
+
+A row with `DERIVED` `true` is a [`WithDerive`](/docs/usage/derived-fields/) write path, not a field mamori resolved. `SCHEME` and `REF` are empty because there is no ref behind it; `VERSION` is a content hash of the value the hook produced. `--compare` ignores these rows, so a derive never reports as drift.
 
 ## status
 
@@ -43,10 +46,11 @@ mamori status --endpoint <ep> [--insecure] [--watch] [--interval <dur>]
 
 ```bash
 $ mamori status --endpoint unix:///run/app-admin.sock --watch --interval 5s
-PATH        SCHEME  REF               VERSION  STALE  LAST_KIND  LAST_ERROR  SENSITIVE
-Redis.Addr  env     env://REDIS_ADDR  3        false  -          -           false
+PATH        SCHEME  REF               VERSION   STALE  LAST_KIND  LAST_ERROR  SENSITIVE  DERIVED
+Redis.Addr  env     env://REDIS_ADDR  3         false  -          -           false      false
+DSN                                   a3f9c1e2  false  -          -           true       true
 
-HEALTHY: 1 field(s), snapshot 3 (live 3), generated 2026-07-26T10:00:00Z
+HEALTHY: 2 field(s), snapshot 3 (live 3), generated 2026-07-26T10:00:00Z
 # ...re-renders every 5s until Ctrl-C
 ```
 

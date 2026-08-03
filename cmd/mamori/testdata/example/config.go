@@ -4,8 +4,8 @@
 // module (see go.mod) with a local stub of github.com/xavidop/mamori/secret
 // (see stub/secret), rather than depending on the real core module and its
 // full dependency graph: hermetic and fast, with no real-core dependency
-// tree in this fixture's go.sum. See cmd/mamori's task report for why this
-// approach was chosen over pointing the replace at the real core module.
+// tree in this fixture's go.sum, rather than pointing the replace at the
+// real core module.
 package example
 
 import "github.com/xavidop/mamori/secret"
@@ -81,6 +81,32 @@ type Config struct {
 	// Redis carries no source tag but is a struct type: Extract recurses
 	// into it, contributing dotted paths Redis.Addr and Redis.Password.
 	Redis RedisConfig
+
+	// Computed carries no source tag but is validated, which mamori enforces
+	// because the validator runs against the whole struct. It is the fixture
+	// for KindValidate: schema must emit it, explain and policy must not.
+	Computed string `validate:"required"`
+
+	// Nested carries no source tag but its type, TaggedNest, does carry its
+	// own validate tag on this field. walkFields must still recurse into it
+	// to reach Nested.Addr: this is the regression fixture for the ordering
+	// trap (see TaggedNest's doc comment).
+	Nested TaggedNest `validate:"required"`
+
+	// DSN carries no source tag and no validate tag: nothing in walkFields
+	// would ever emit it. It exists only for derives.go's
+	// mamori.WithDerive(fn, "DSN") call to declare, making it the fixture for
+	// KindDerived (see extract.go's FieldKind and cmd/mamori/derives.go):
+	// the only way this field can appear in `mamori explain` or `mamori
+	// schema` is by reading that call site statically.
+	DSN string
+}
+
+// TaggedNest is a nested struct carrying its own validate tag. walkFields must
+// still recurse into it to reach Addr; emitting TaggedNest as a validate-only
+// leaf would make every nested source field disappear.
+type TaggedNest struct {
+	Addr string `source:"env:NEST_ADDR"`
 }
 
 // RedisConfig is nested inside Config (via the Redis field above) and also
@@ -97,4 +123,49 @@ type RedisConfig struct {
 type ServerConfig struct {
 	Host string `source:"env:SERVER_HOST"`
 	Port string `source:"env:SERVER_PORT" default:"9090" onfail:"default"`
+}
+
+// IncompleteConfig backs TestExplainNotesIncompleteDerives
+// (explain.go's derivesIncompleteNote): it carries a real source: tagged
+// field (so it appears in Extract's output at all); derives.go's init
+// declares a WithDerive call for it whose write path is a variable, which
+// findDerives cannot read statically. Its type is declared here, alongside
+// Config and friends, rather than in derives.go, deliberately: taggedStructs
+// orders same-package structs by token.Pos, and that ordering is only
+// reliable within one file's AST -- across files in the same package it can
+// vary between otherwise-identical runs (parsing runs concurrently per
+// file), which would make explain.table.golden/explain.json.golden flake.
+type IncompleteConfig struct {
+	Name string `source:"env:INCOMPLETE_NAME"`
+}
+
+// DeriveOverlap backs TestExtractDerivedPathKeepsSourceTaggedEntry and
+// TestExtractDerivedPathKeepsValidateRules: a WithDerive write path is allowed
+// to name a field that ALSO carries a source: or validate: tag (the derive
+// runs after decoding and simply wins -- see
+// site/src/pages/docs/usage/derived-fields.md), which means walkFields and
+// derivedFields can both have something to say about the same Path. Only the
+// walkFields entry may survive; a second, KindDerived entry carries no
+// Default/Optional/Validate at all, and schema.go's last-write-wins
+// builderNode.insert let it erase them.
+//
+// Declared here in config.go rather than in derives.go for the same reason
+// IncompleteConfig is (see its doc comment): taggedStructs orders same-package
+// structs by token.Pos, which is only reliable within one file.
+type DeriveOverlap struct {
+	// Port is the source-tagged shape: defaulted and optional, and also a
+	// declared derive write path. The duplicate entry dropped its "8080"
+	// default and pushed Port into the schema's "required" array despite
+	// optional:"true".
+	Port string `source:"env:OVERLAP_PORT" default:"8080" optional:"true"`
+
+	// DSN is the validate-only shape: no source tag, so walkFields emits it as
+	// KindValidate, and also a declared derive write path. The duplicate entry
+	// carried an empty Validate, which dropped minLength from the schema.
+	DSN string `validate:"required,min=10"`
+
+	// Derived carries neither tag, so walkFields never emits it and the
+	// declared write path is the only thing that can: the skip above must not
+	// swallow the genuinely derive-only case it is surrounded by.
+	Derived string
 }

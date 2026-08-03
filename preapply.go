@@ -35,44 +35,30 @@ const defaultPreApplyTimeout = 10 * time.Second
 //	    }),
 //	)
 //
-// The hook runs on the reconciler goroutine, because it has to complete before
-// the swap and the OnChange dispatch queue is asynchronous and lossy by design
-// (WithQueueDepth drops the oldest event when full); a gate cannot be delivered
-// on a channel that is allowed to drop. Two consequences follow, and both
-// matter:
+// The hook runs on the reconciler goroutine: it must complete before the swap,
+// and the OnChange dispatch queue is asynchronous and lossy by design, so a
+// gate cannot ride on it. Two consequences follow.
 //
 // It is bounded by WithPreApplyTimeout, and the bound cannot be removed.
 //
-// It must not call back into the same Watcher, and mamori now catches it when
-// it does. Get is lock-free and safe here - it Loads a pointer the reconciler
-// already published, so it returns whatever Get returns anywhere else at this
-// instant: the snapshot this candidate would supersede, unless the watcher is
-// pinned, in which case it is the pinned one and the candidate supersedes
-// something else. Pin, PinCurrent, Unpin and Refresh are not safe: they are
-// serviced by the very goroutine the hook is occupying, so sendPin (pin.go)
-// would be waiting for a receiver that cannot exist until this hook returns.
-// That used to block until Close - no reconciliation, no OnChange, no OnError,
-// no diagnostic of any kind, and the hook's own timeout does not rescue it,
-// because the hook is parked inside sendPin, which never looks at the context
-// this hook was given.
-//
-// It is now detected instead, per call, and the hook keeps running:
+// It must not call back into the same Watcher. Get is safe: it Loads a pointer
+// the reconciler already published, returning the snapshot this candidate would
+// supersede, or the pinned one while pinned. Pin, PinCurrent, Unpin, and
+// Refresh are not, since they are serviced by the very goroutine the hook
+// occupies. Each is refused per call and the hook keeps running:
 //
 //   - Pin returns ErrReentrantCall, having pinned nothing.
 //   - PinCurrent returns 0, which no real version ever is.
 //   - Unpin does nothing and leaves the watcher pinned exactly as it was.
-//   - Refresh returns ErrReentrantCall, having re-resolved nothing. Its own
-//     context does not save it: the hook would have to outlive the refresh it
-//     is waiting for, and Refresh(context.Background()) has no deadline at all.
+//   - Refresh returns ErrReentrantCall, having re-resolved nothing.
 //
-// The detection is keyed on which goroutine is inside the hook, not merely that
-// one is, so a Pin issued from an unrelated goroutine that happens to overlap a
-// hook is untouched: it waits its turn and is serviced normally, as before.
+// Detection is keyed on which goroutine is inside the hook, not merely that one
+// is, so a Pin from an unrelated goroutine that happens to overlap a hook waits
+// its turn and is serviced normally.
 //
-// An OnError callback is in the same position and gets the same treatment - it
-// too runs inline on the reconciler goroutine. See ErrReentrantCall for the
-// whole of that rule; OnChange, which is delivered from the dispatch queue on
-// its own goroutine, is not affected by any of it.
+// An OnError callback runs inline on the same goroutine and gets the same
+// treatment. See ErrReentrantCall for the whole rule. OnChange is delivered
+// from the dispatch queue on its own goroutine and is unaffected.
 //
 // It is typed to the same T passed to Watch, and runs on the initial load as
 // well as on every subsequent update, so a credential that does not work is
@@ -102,8 +88,8 @@ func PreApply[T any](fn func(ctx context.Context, ev Change[T]) error) Option {
 // literally is worse still: context.WithTimeout(parent, 0) returns a context
 // that is ALREADY expired, so every candidate would be refused on the deadline
 // check - including the initial load, which would make Watch and Load fail at
-// startup with a DeadlineExceeded a caller writing WithPreApplyTimeout(0) is
-// unlikely to read as "you disabled the gate". Elsewhere in this package a zero
+// startup with a DeadlineExceeded that a caller writing WithPreApplyTimeout(0)
+// is unlikely to read as "you disabled the gate". Elsewhere in this package a zero
 // duration disables a feature (WithStale), so the one reading a caller is most
 // likely to have in mind is the one meaning this option cannot express at all.
 func WithPreApplyTimeout(d time.Duration) Option {
@@ -178,11 +164,12 @@ func runPreApply[T any](parent context.Context, hook func(context.Context, Chang
 // mark is set, sendPinCtx (pin.go) refuses a control-channel command issued from
 // that same goroutine, which is the only caller that can never be answered.
 //
-// Two callbacks need this, and they are exactly the two that run there:
-// runPreApply's hook, and emitErr's OnError (reconciler.go). OnChange does not,
-// and must not have it - it runs on the dispatch goroutine, which receives from
-// a queue rather than occupying the reconciler, so a Pin or Refresh from inside
-// OnChange is an ordinary caller waiting its ordinary turn.
+// Three callbacks need this, and they are exactly the three that run there:
+// runPreApply's hook, buildCandidate's derive loop, and emitErr's OnError
+// (both in reconciler.go). OnChange does not, and must not have it - it runs
+// on the dispatch goroutine, which receives from a queue rather than
+// occupying the reconciler, so a Pin or Refresh from inside OnChange is an
+// ordinary caller waiting its ordinary turn.
 //
 // It restores the PREVIOUS value rather than storing 0, which is what makes it
 // safe to arm in more than one place. emitErr is reachable from inside flush's
@@ -209,40 +196,25 @@ const goroutineIDPrefix = "goroutine "
 //
 // Go deliberately does not expose goroutine identity, so this reads it back out
 // of the one place the runtime does print it: the header line of the
-// goroutine's own stack trace. That is a real cost in taste, and it is paid
-// here rather than in the alternative because the alternative is worse. A mark
-// that recorded only THAT a callback is running would refuse a Pin from any
-// unrelated caller goroutine that merely overlapped one - once per rotation and
-// once per error delivery, for as long as the callback runs, with an error
-// telling the caller to do the thing it was already doing. Identity is what
-// makes the refusal apply to exactly the caller that is actually deadlocking
-// itself.
+// goroutine's own stack trace. Identity is what the check needs: a mark that
+// recorded only THAT a callback is running, rather than which goroutine, would
+// refuse a Pin from any unrelated caller that merely overlapped one, with an
+// error telling it to do the thing it was already doing.
 //
 // runtime.Stack(buf, false) walks only the calling goroutine, so it does not
-// stop the world. A small buffer truncates the OUTPUT, not the walk: the runtime
-// still traverses every frame, so the cost stays proportional to the caller's
-// stack depth rather than being fixed - measured at a couple of microseconds a
-// few frames down, and ~40us at depth 200. That is affordable where this is
-// reached from, and it is worth knowing where that is:
+// stop the world, and a small buffer truncates the OUTPUT rather than the walk,
+// so cost stays proportional to stack depth - a couple of microseconds a few
+// frames down, ~40us at depth 200. Arming (once per PreApply hook invocation
+// and once per OnError delivery) runs near the bottom of the reconciler
+// goroutine's own shallow stack, where that figure holds; checking, in
+// sendPinCtx (pin.go), runs on the caller's own stack, which can be arbitrarily
+// deep, but is reached only when a command actually overlaps a running
+// callback - zero cost otherwise.
 //
-//   - Arming, once per PreApply hook invocation (armReentrancy, called from
-//     runPreApply) and once per OnError delivery (emitErr, reconciler.go). Both
-//     run near the bottom of the reconciler goroutine's own shallow stack, where
-//     the microsecond figure holds, and neither is on a per-flush path: a
-//     watcher with no hook and no OnError callback reaches this never.
-//   - Checking, in sendPinCtx (pin.go), once per control-channel command that
-//     actually overlaps one of those callbacks. That caller's stack is the
-//     application's own and can be arbitrarily deep, so the microsecond figure
-//     does NOT hold there. It is bounded instead by how rare the overlap is:
-//     zero cost when no callback is running, which for a watcher without either
-//     is always.
-//
-// Every failure path returns 0, and 0 is the same value the mark holds when no
-// callback is running, so a parse that ever stopped matching the runtime's format
-// would silently disable the detection and restore the previous behavior. It
-// can never manufacture a false match, which is the direction that matters: a
-// missed detection is the bug this package documented for a release, while a
-// false one would break correct code.
+// Every failure path returns 0, the same value the mark holds when no callback
+// is running, so a parse that stopped matching the runtime's format would
+// silently disable the detection rather than manufacture a false match: a
+// missed detection is a bug, a false one would break correct code.
 func goroutineID() uint64 {
 	var buf [40]byte
 	n := runtime.Stack(buf[:], false)

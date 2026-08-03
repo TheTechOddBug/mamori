@@ -6,6 +6,14 @@ import (
 )
 
 // si builds a one-struct slice with the given fields, for brevity in tests.
+//
+// The privilege-delta tests below set Kind: KindSource on their fields and the
+// pure structural-diff tests do not, which is not an inconsistency:
+// computeDiff's own walk never reads Field.Kind, but computePrivilegeDelta
+// reaches collectPolicyRefs (policy.go), which skips every field whose Kind is
+// not KindSource. Drop those tags and the four privilege tests stop seeing any
+// refs at all and fail. They are load-bearing, and they also mirror what a
+// real Extract emits for a source-tagged field.
 func si(pkg, typeName string, fields ...Field) []StructInfo {
 	return []StructInfo{{Package: pkg, TypeName: typeName, Fields: fields}}
 }
@@ -231,9 +239,9 @@ func TestComputeDiffChainOnlyChangeStillCountsAsModified(t *testing.T) {
 
 func TestComputePrivilegeDeltaAddedAndRemoved(t *testing.T) {
 	base := si("acme/svc", "Config",
-		Field{Path: "A", Source: "aws-sm://prod/legacy#k", Refs: []string{"aws-sm://prod/legacy#k"}})
+		Field{Path: "A", Kind: KindSource, Source: "aws-sm://prod/legacy#k", Refs: []string{"aws-sm://prod/legacy#k"}})
 	head := si("acme/svc", "Config",
-		Field{Path: "A", Source: "aws-sm://prod/stripe#k", Refs: []string{"aws-sm://prod/stripe#k"}})
+		Field{Path: "A", Kind: KindSource, Source: "aws-sm://prod/stripe#k", Refs: []string{"aws-sm://prod/stripe#k"}})
 
 	got := computePrivilegeDelta(base, head)
 
@@ -247,7 +255,7 @@ func TestComputePrivilegeDeltaAddedAndRemoved(t *testing.T) {
 
 func TestComputePrivilegeDeltaIgnoresUnchangedPaths(t *testing.T) {
 	in := si("acme/svc", "Config",
-		Field{Path: "A", Source: "aws-sm://prod/db#p", Refs: []string{"aws-sm://prod/db#p"}})
+		Field{Path: "A", Kind: KindSource, Source: "aws-sm://prod/db#p", Refs: []string{"aws-sm://prod/db#p"}})
 
 	got := computePrivilegeDelta(in, in)
 
@@ -258,10 +266,10 @@ func TestComputePrivilegeDeltaIgnoresUnchangedPaths(t *testing.T) {
 
 func TestComputePrivilegeDeltaCoversNonPolicySchemes(t *testing.T) {
 	base := si("acme/svc", "Config",
-		Field{Path: "A", Source: "env:X", Refs: []string{"env:X"}})
+		Field{Path: "A", Kind: KindSource, Source: "env:X", Refs: []string{"env:X"}})
 	head := si("acme/svc", "Config",
-		Field{Path: "A", Source: "env:X", Refs: []string{"env:X"}},
-		Field{Path: "B", Source: "vault://kv/data/api#token", Refs: []string{"vault://kv/data/api#token"}})
+		Field{Path: "A", Kind: KindSource, Source: "env:X", Refs: []string{"env:X"}},
+		Field{Path: "B", Kind: KindSource, Source: "vault://kv/data/api#token", Refs: []string{"vault://kv/data/api#token"}})
 
 	got := computePrivilegeDelta(base, head)
 
@@ -290,10 +298,10 @@ func TestPrivilegeGrew(t *testing.T) {
 
 func TestComputeDiffIncludesPrivilegeDelta(t *testing.T) {
 	base := si("acme/svc", "Config",
-		Field{Path: "A", Source: "env:X", Refs: []string{"env:X"}})
+		Field{Path: "A", Kind: KindSource, Source: "env:X", Refs: []string{"env:X"}})
 	head := si("acme/svc", "Config",
-		Field{Path: "A", Source: "env:X", Refs: []string{"env:X"}},
-		Field{Path: "B", Source: "aws-sm://prod/stripe#k", Refs: []string{"aws-sm://prod/stripe#k"}, Sensitive: true})
+		Field{Path: "A", Kind: KindSource, Source: "env:X", Refs: []string{"env:X"}},
+		Field{Path: "B", Kind: KindSource, Source: "aws-sm://prod/stripe#k", Refs: []string{"aws-sm://prod/stripe#k"}, Sensitive: true})
 
 	got := computeDiff(base, head)
 

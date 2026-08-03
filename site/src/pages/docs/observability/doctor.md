@@ -11,9 +11,26 @@ func Doctor[T any](ctx context.Context, opts ...Option) (Report, error)
 
 `Doctor` resolves every field of `T` exactly once and returns a [`Report`](/docs/observability/#report-and-fieldstatus) describing what succeeded and what failed, without starting a watcher. It accepts the same `Option`s as `Load` and `Watch`, so it exercises your real provider wiring, middleware, and `Prefix` rewriting.
 
-Unlike `Load`, `Doctor` never aborts on the first failure: it walks every field and records each result, so one run reports every misconfigured ref instead of just the first. The returned `error` is non-nil only when `T` itself cannot be walked as a config struct (an unsupported field type, for example); individual field failures live in the `Report`, not the returned error. `Doctor` does not decode or validate values.
+Unlike `Load`, `Doctor` never aborts on the first failure: it walks every field a `source` tag declares and records each result, so one run reports every misconfigured ref instead of just the first. The returned `error` is non-nil only when `T` itself cannot be walked as a config struct (an unsupported field type, for example); individual field failures live in the `Report`, not the returned error. `Doctor` never validates values and never hands back a populated `T`.
 
 `Report.Snapshot` and `Report.Live` are always `0` for a `Doctor` report (and `Report.Pinned` is always `false`), marking a one-shot probe rather than a running watcher's snapshot (whose version starts at 1).
+
+## Derived fields are probed
+
+`Doctor` also runs your [`WithDerive`](/docs/usage/derived-fields/) hooks against the values it just resolved, and adds one [`FieldStatus`](/docs/observability/#report-and-fieldstatus) per declared write path. Four outcomes:
+
+| Outcome | The row | Healthy? |
+| --- | --- | --- |
+| Hook succeeded | `Version` is a content hash of the value | yes |
+| Hook returned an error | `Version` blank, `LastKind` `invalid`, `LastError` is the hook's error | no |
+| An input produced no value | hook never ran, `Version` blank, `LastError` says not evaluated, no `LastKind` | unchanged |
+| Hooks cannot be typed to `T` | one `invalid` row per declared path | no |
+
+A field counts as having produced a value if it resolved, fell back to its `default` (including via `onfail:"default"`), or is an absent `optional`. Anything else blocks the hooks, including `unavailable`, `rate_limited`, and `unknown`, which leave the report healthy but leave the hook nothing to read. Deriving from a zero value would publish a version that looks real and does not match production.
+
+Blocking is all-or-nothing: mamori cannot tell which fields a hook reads, so one unresolved field blocks every derived row.
+
+`Doctor` executes your hook code, so a hook with a side effect runs for real on every `Doctor` run.
 
 ## Run it before a watcher starts
 

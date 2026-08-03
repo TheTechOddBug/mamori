@@ -14,6 +14,15 @@ type Meter interface {
 	// (nil on success).
 	RecordResolve(scheme string, dur time.Duration, err error)
 	// RecordRefresh reports that a watched value changed and was reconciled.
+	// scheme is always a real provider scheme (env, aws-sm, vault, ...), never
+	// empty and never a placeholder: a WithDerive-declared field changing
+	// never calls this, because it has no ref and therefore no scheme to
+	// report, and a derive rebuild is not a "watched value" changing in the
+	// first place - it is a pure recomputation from fields that were already
+	// watched (and already recorded their own RecordRefresh when they
+	// changed). See isDerivedPath (reconciler.go), which flush uses to skip
+	// exactly this case rather than recording it under a fabricated scheme
+	// label.
 	RecordRefresh(scheme string)
 	// RecordWatchError reports a provider watch-channel error.
 	RecordWatchError(scheme string)
@@ -30,7 +39,7 @@ type Meter interface {
 }
 
 // RejectReason names why a candidate configuration was refused. It is a closed
-// set of two so an adapter can use it as a metric label without unbounded
+// set of three so an adapter can use it as a metric label without unbounded
 // cardinality, which a free-form string would invite.
 type RejectReason string
 
@@ -39,6 +48,8 @@ const (
 	RejectValidation RejectReason = "validation"
 	// RejectPreApply means a PreApply hook refused the change.
 	RejectPreApply RejectReason = "preapply"
+	// RejectDerive means a WithDerive hook returned an error.
+	RejectDerive RejectReason = "derive"
 )
 
 // Tracer is the minimal tracing sink mamori emits to (see Meter for the no-dep

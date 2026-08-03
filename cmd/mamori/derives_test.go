@@ -1,0 +1,352 @@
+package main
+
+import (
+	"encoding/json"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
+
+// derivesFor loads the fixture module's packages (the same t.Chdir/GOWORK=off
+// pattern runExplain uses, see explain_test.go) and runs findDerives
+// directly, for tests that assert on its two return values without going
+// through the explain command layer.
+func derivesFor(t *testing.T, patterns ...string) (map[string][]string, map[string]bool) {
+	t.Helper()
+	root := moduleRoot(t)
+	enterFixtureModule(t, filepath.Join(root, "testdata", "example"))
+
+	pkgs, err := loadPackages(patterns)
+	if err != nil {
+		t.Fatalf("loadPackages(%v): %v", patterns, err)
+	}
+	return findDerives(pkgs)
+}
+
+// TestFindDerivesLiteralPaths: WithDerive(fn, "DSN")-shaped call with a
+// single literal path is discovered under the target type's own key.
+func TestFindDerivesLiteralPaths(t *testing.T) {
+	declared, _ := derivesFor(t, "./...")
+	got := declared["example.com/fixture.DeriveLiteral"]
+	if want := []string{"Value"}; !slices.Equal(got, want) {
+		t.Errorf("declared[DeriveLiteral] = %v, want %v", got, want)
+	}
+}
+
+// TestFindDerivesMultiplePaths: WithDerive(fn, "A", "B") yields both paths.
+func TestFindDerivesMultiplePaths(t *testing.T) {
+	declared, _ := derivesFor(t, "./...")
+	got := declared["example.com/fixture.DeriveMulti"]
+	if want := []string{"A", "B"}; !slices.Equal(got, want) {
+		t.Errorf("declared[DeriveMulti] = %v, want %v", got, want)
+	}
+}
+
+// TestFindDerivesTwoCallsSameType: two separate calls against the same T
+// accumulate rather than the second overwriting the first.
+func TestFindDerivesTwoCallsSameType(t *testing.T) {
+	declared, _ := derivesFor(t, "./...")
+	got := declared["example.com/fixture.DeriveAccumulate"]
+	if want := []string{"X", "Y"}; !slices.Equal(got, want) {
+		t.Errorf("declared[DeriveAccumulate] = %v, want %v (two calls must accumulate)", got, want)
+	}
+}
+
+// TestFindDerivesCrossPackage: the WithDerive call lives in a different
+// package (derivecaller) than its target type T (example.CrossTarget).
+// findDerives must key its result by T's own package, not the call site's.
+func TestFindDerivesCrossPackage(t *testing.T) {
+	declared, _ := derivesFor(t, "./...")
+	got := declared["example.com/fixture.CrossTarget"]
+	if want := []string{"Cross"}; !slices.Equal(got, want) {
+		t.Errorf("declared[CrossTarget] = %v, want %v (call site lives in a different package than T)", got, want)
+	}
+}
+
+// TestFindDerivesUnknownPathDropped: a path naming no field on T ("Bogus")
+// is dropped, while a real path declared in the same call ("Real") survives,
+// and the type is not marked incomplete - an unmatched path is valid,
+// deliberate WithDerive usage, not something the matcher failed to read.
+func TestFindDerivesUnknownPathDropped(t *testing.T) {
+	declared, incomplete := derivesFor(t, "./...")
+	got := declared["example.com/fixture.DeriveUnknown"]
+	if want := []string{"Real"}; !slices.Equal(got, want) {
+		t.Errorf("declared[DeriveUnknown] = %v, want %v (Bogus names no field and must be dropped)", got, want)
+	}
+	if incomplete["example.com/fixture.DeriveUnknown"] {
+		t.Error("DeriveUnknown marked incomplete, want false: an unknown field name is dropped, not unreadable")
+	}
+}
+
+// TestFindDerivesNonLiteralMarks: WithDerive(fn, paths...) with paths a
+// variable cannot be read statically, so it must set DerivesIncomplete for
+// that type and must not guess at a declared path.
+func TestFindDerivesNonLiteralMarks(t *testing.T) {
+	declared, incomplete := derivesFor(t, "./...")
+	if !incomplete["example.com/fixture.DeriveNonLiteral"] {
+		t.Error("DeriveNonLiteral not marked incomplete, want true: its write paths come from a variable, not a string literal")
+	}
+	if got := declared["example.com/fixture.DeriveNonLiteral"]; len(got) != 0 {
+		t.Errorf("declared[DeriveNonLiteral] = %v, want none: a non-literal argument cannot be read statically", got)
+	}
+}
+
+// TestFindDerivesIgnoresLocalFunc: a local function named WithDerive (not
+// github.com/xavidop/mamori's) must never contribute to findDerives's
+// result, proving the callee is resolved through types, not name text.
+func TestFindDerivesIgnoresLocalFunc(t *testing.T) {
+	declared, _ := derivesFor(t, "./...")
+	if got := declared["example.com/fixture.LocalFuncTarget"]; len(got) != 0 {
+		t.Errorf("declared[LocalFuncTarget] = %v, want none: this package's own WithDerive must not be mistaken for mamori's", got)
+	}
+}
+
+// TestFindDerivesIgnoresTestOnlyFile is Step 5's fixture: a WithDerive call
+// declared only in a _test.go file must not appear, because Extract's
+// loadPackages never sets packages.Config.Tests.
+func TestFindDerivesIgnoresTestOnlyFile(t *testing.T) {
+	declared, _ := derivesFor(t, "./...")
+	if got := declared["example.com/fixture.DeriveTestOnly"]; len(got) != 0 {
+		t.Errorf("declared[DeriveTestOnly] = %v, want none: a WithDerive call declared only in a _test.go file must be invisible", got)
+	}
+}
+
+// TestExplainListsDerivedField is the one end-to-end check through
+// runExplain: Config.DSN carries no source: tag at all, so the only way it
+// can appear in `mamori explain` is via derives.go's
+// mamori.WithDerive(fn, "DSN") being wired into Extract's output as a
+// KindDerived field. Config's derive call is fully literal, so the
+// incomplete-derives note must not print for it.
+func TestExplainListsDerivedField(t *testing.T) {
+	stdout, stderr, code := runExplain(t, "--type=Config", "./...")
+	if code != 0 {
+		t.Fatalf("explainCmd() code = %d, stderr = %s", code, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
+
+	found := false
+	for _, line := range strings.Split(stdout, "\n") {
+		cols := strings.Fields(line)
+		if len(cols) > 0 && cols[0] == "DSN" {
+			found = true
+			if cols[1] != "string" {
+				t.Errorf("DSN TYPE column = %q, want %q", cols[1], "string")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("explain table missing DSN, a WithDerive-declared field:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "note:") {
+		t.Errorf("explain printed the incomplete-derives note for Config, whose only derive call is fully literal:\n%s", stdout)
+	}
+}
+
+// TestExplainNotesIncompleteDerives exercises explain.go's derivesIncompleteNote:
+// IncompleteConfig's WithDerive call declares its write path via a variable
+// (derives.go), so DerivesIncomplete must be true and explain must print the
+// note after its table rather than silently listing an incomplete set as if
+// it were complete.
+func TestExplainNotesIncompleteDerives(t *testing.T) {
+	stdout, stderr, code := runExplain(t, "--type=IncompleteConfig", "./...")
+	if code != 0 {
+		t.Fatalf("explainCmd() code = %d, stderr = %s", code, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
+
+	want := "note: this struct declares WithDerive write paths that could not be read\n" +
+		"      statically (a variable or a slice expansion); the derived fields listed\n" +
+		"      above may be incomplete\n"
+	if !strings.Contains(stdout, want) {
+		t.Errorf("stdout missing incomplete-derives note:\n%s", stdout)
+	}
+}
+
+// extractOne runs Extract against the fixture module for a single struct type
+// and returns its StructInfo, for tests that assert on Extract's own field
+// list rather than on a rendered command's output.
+func extractOne(t *testing.T, typeName string) StructInfo {
+	t.Helper()
+	root := moduleRoot(t)
+	enterFixtureModule(t, filepath.Join(root, "testdata", "example"))
+
+	structs, err := Extract([]string{"./..."}, typeName, nil)
+	if err != nil {
+		t.Fatalf("Extract(--type=%s): %v", typeName, err)
+	}
+	if len(structs) != 1 {
+		t.Fatalf("Extract(--type=%s) returned %d structs, want 1", typeName, len(structs))
+	}
+	return structs[0]
+}
+
+// fieldsWithPath returns every Field in si whose Path is path. It returns a
+// slice, not a single Field, precisely because the bug under test was Extract
+// emitting two entries for one path.
+func fieldsWithPath(si StructInfo, path string) []Field {
+	var got []Field
+	for _, f := range si.Fields {
+		if f.Path == path {
+			got = append(got, f)
+		}
+	}
+	return got
+}
+
+// TestExtractDerivedPathKeepsSourceTaggedEntry covers the first of the two
+// shapes where a WithDerive write path names a field walkFields already
+// emitted: DeriveOverlap.Port carries source:, default:, and optional:"true"
+// AND is a declared write path. Appending a KindDerived entry for it produced
+// two Port rows in `mamori explain`, two "Path": "Port" entries in
+// `explain --json` (which `mamori diff` consumes), and -- because schema.go's
+// builderNode.insert is last-write-wins and a KindDerived Field sets none of
+// Default/HasDefault/Optional/Validate -- a schema where Port had lost its
+// "8080" default and moved into "required" despite optional:"true".
+func TestExtractDerivedPathKeepsSourceTaggedEntry(t *testing.T) {
+	si := extractOne(t, "DeriveOverlap")
+
+	got := fieldsWithPath(si, "Port")
+	if len(got) != 1 {
+		t.Fatalf("Extract emitted %d entries for DeriveOverlap.Port, want exactly 1: %+v", len(got), got)
+	}
+	f := got[0]
+	if f.Kind != KindSource {
+		t.Errorf("Port Kind = %q, want %q: the source-tagged entry is the one that must survive", f.Kind, KindSource)
+	}
+	if !f.HasDefault || f.Default != "8080" {
+		t.Errorf("Port HasDefault/Default = %v/%q, want true/%q", f.HasDefault, f.Default, "8080")
+	}
+	if !f.Optional {
+		t.Error("Port Optional = false, want true: optional:\"true\" must survive the derive declaration")
+	}
+	if f.Source != "env:OVERLAP_PORT" {
+		t.Errorf("Port Source = %q, want %q", f.Source, "env:OVERLAP_PORT")
+	}
+}
+
+// TestExtractDerivedPathKeepsValidateRules covers the second shape:
+// DeriveOverlap.DSN carries no source: tag but does carry
+// validate:"required,min=10", so walkFields emits it as KindValidate, and it
+// is also a declared write path. The KindDerived duplicate carried an empty
+// Validate and won, which dropped minLength from the schema -- defeating the
+// point of emitting validate-tagged fields at all, for exactly the fields
+// both features touch.
+func TestExtractDerivedPathKeepsValidateRules(t *testing.T) {
+	si := extractOne(t, "DeriveOverlap")
+
+	got := fieldsWithPath(si, "DSN")
+	if len(got) != 1 {
+		t.Fatalf("Extract emitted %d entries for DeriveOverlap.DSN, want exactly 1: %+v", len(got), got)
+	}
+	f := got[0]
+	// The point of this test is that the validate rules survive, which is what
+	// the duplicate used to destroy. The surviving entry's Kind is KindDerived,
+	// not KindValidate: it is a declared write path, and explain drops
+	// validate-only fields, so labelling it KindValidate would hide a genuine
+	// derive from explain and diff. See
+	// TestDerivedPathWithOnlyValidateTagStaysVisibleToExplain.
+	if f.Kind != KindDerived {
+		t.Errorf("DSN Kind = %q, want %q", f.Kind, KindDerived)
+	}
+	if f.Validate != "required,min=10" {
+		t.Errorf("DSN Validate = %q, want %q: the rules the duplicate used to destroy", f.Validate, "required,min=10")
+	}
+}
+
+// TestExtractStillEmitsDeriveOnlyPath is the other half of the skip: a
+// declared write path naming a field with neither a source: nor a validate:
+// tag has no walkFields entry to defer to, so it must still produce its
+// KindDerived one. Without this, the fix for the two tests above could pass by
+// dropping derived fields entirely.
+func TestExtractStillEmitsDeriveOnlyPath(t *testing.T) {
+	si := extractOne(t, "DeriveOverlap")
+
+	got := fieldsWithPath(si, "Derived")
+	if len(got) != 1 {
+		t.Fatalf("Extract emitted %d entries for DeriveOverlap.Derived, want exactly 1: %+v", len(got), got)
+	}
+	if got[0].Kind != KindDerived {
+		t.Errorf("Derived Kind = %q, want %q", got[0].Kind, KindDerived)
+	}
+}
+
+// TestSchemaDerivedOverlapKeepsDefaultAndRules is the end-to-end consequence
+// of the two tests above, asserted where a user would actually notice it: the
+// emitted JSON Schema. Port keeps its default and stays out of "required";
+// DSN keeps the minLength its validate: rule asks for.
+func TestSchemaDerivedOverlapKeepsDefaultAndRules(t *testing.T) {
+	root := moduleRoot(t)
+	fixtureDir := filepath.Join(root, "testdata", "example")
+
+	stdout, stderr, code := runSchema(t, fixtureDir, "--type=DeriveOverlap", "./...")
+	if code != 0 {
+		t.Fatalf("schemaCmd(--type=DeriveOverlap) = %d, stderr = %s", code, stderr)
+	}
+
+	var doc struct {
+		Properties map[string]struct {
+			Default   any      `json:"default"`
+			MinLength *int     `json:"minLength"`
+			Type      string   `json:"type"`
+			Enum      []string `json:"enum"`
+		} `json:"properties"`
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("schema output is not valid JSON: %v\n%s", err, stdout)
+	}
+
+	if got := doc.Properties["Port"].Default; got != "8080" {
+		t.Errorf("Port default = %v, want %q", got, "8080")
+	}
+	if slices.Contains(doc.Required, "Port") {
+		t.Errorf("Port is in required %v, want it excluded: it is optional:\"true\" with a default", doc.Required)
+	}
+	if got := doc.Properties["DSN"].MinLength; got == nil || *got != 10 {
+		t.Errorf("DSN minLength = %v, want 10: validate:\"min=10\" must survive the derive declaration", got)
+	}
+	if !slices.Contains(doc.Required, "DSN") {
+		t.Errorf("DSN missing from required %v, want it listed: validate:\"required\"", doc.Required)
+	}
+}
+
+// TestDerivedPathWithOnlyValidateTagStaysVisibleToExplain pins that a declared
+// write path whose field carries only a validate: tag is reported as derived,
+// not as validate-only. explain drops validate-only fields, so leaving the Kind
+// alone would hide a genuine derive path from explain and from diff, which is
+// the opposite of what discovering derives was for. Its validate rules must
+// survive the promotion, since schema still needs them.
+func TestDerivedPathWithOnlyValidateTagStaysVisibleToExplain(t *testing.T) {
+	root := moduleRoot(t)
+	enterFixtureModule(t, filepath.Join(root, "testdata", "example"))
+
+	structs, err := Extract([]string{"./..."}, "DeriveOverlap", nil)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	var found *Field
+	for i := range structs {
+		for j := range structs[i].Fields {
+			if structs[i].Fields[j].Path == "DSN" {
+				if found != nil {
+					t.Fatalf("DSN appears more than once: %+v and %+v", *found, structs[i].Fields[j])
+				}
+				found = &structs[i].Fields[j]
+			}
+		}
+	}
+	if found == nil {
+		t.Fatal("no DSN field in DeriveOverlap")
+	}
+	if found.Kind != KindDerived {
+		t.Fatalf("DSN Kind = %q, want %q: explain drops validate-only fields, so a declared derive path must not stay KindValidate", found.Kind, KindDerived)
+	}
+	if found.Validate == "" {
+		t.Fatal("DSN lost its validate rules in the promotion; schema still needs them")
+	}
+}

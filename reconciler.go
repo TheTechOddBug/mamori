@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,41 +82,32 @@ type Watcher[T any] struct {
 	// what lets Close rely on a command already in flight being answered even
 	// after cancel() has been called.
 	control chan pinCmd
-	// ctx is the reconciler's own context (wctx from Watch, the child of the
-	// caller's parent ctx created via context.WithCancel). sendPin selects on
-	// ctx.Done() so it never blocks forever once the reconciler goroutine has
-	// exited, for ANY reason: Close cancels ctx via w.cancel(), and the
-	// parent ctx passed to Watch being cancelled independently of Close also
-	// cancels ctx, since it is a child context. Either path leaves control
-	// with no receiver (loop has returned), and ctx.Done() is what gives
-	// sendPin a way out in both cases, not just the Close one. Done() closes
-	// synchronously as part of the cancel call itself (context.CancelFunc
-	// does not return until its Done channel, and every child's, is already
-	// closed), so a sendPin call blocked on control unblocks the moment
-	// Close (or an external cancel of the parent ctx) happens, with no
-	// separate "closed" signal needed to get the same guarantee.
+	// ctx is the reconciler's own context (wctx from Watch, a child of the
+	// caller's context). sendPin selects on ctx.Done() so it can never block
+	// forever once the reconciler goroutine has exited, whether that is
+	// because Close cancelled ctx or because the caller's own parent context
+	// was cancelled independently of Close; see sendPin (pin.go) for how it
+	// uses this.
 	ctx context.Context
 
 	// inCallback holds the ID of the goroutine currently running one of this
-	// watcher's INLINE callbacks, and 0 whenever none is - which is always, for
-	// a watcher that installed neither. Two arm it, and they are exactly the two
-	// this package runs on the reconciler goroutine itself: flush's PreApply
-	// gate (via runPreApply's mark parameter) and emitErr's OnError. So it names
-	// the reconciler goroutine and no other; sendPinCtx is the only reader.
+	// watcher's INLINE callbacks, and 0 whenever none is. Three arm it: flush's
+	// PreApply gate (via runPreApply's mark parameter), buildCandidate's derive
+	// loop, and emitErr's OnError - see reentrantCallbacks (errors.go) for that
+	// list kept as data, and the test that checks it against the real call
+	// sites. sendPinCtx is the only reader.
 	//
-	// OnChange is deliberately absent. It runs on the dispatch goroutine, which
-	// receives Change events from a queue rather than occupying the reconciler,
-	// so an OnChange callback calling Pin or Refresh is an ordinary caller whose
-	// command is serviced in the ordinary way - marking it would refuse correct
-	// code. See armReentrancy (preapply.go) for the rest of that reasoning, and
-	// for why the disarm restores the previous value rather than storing 0.
+	// OnChange is deliberately absent. It runs on the dispatch goroutine rather
+	// than occupying the reconciler, so an OnChange callback calling Pin or
+	// Refresh is an ordinary caller whose command is serviced normally -
+	// marking it here would refuse correct code.
 	//
 	// It is a goroutine ID rather than a bool because the two questions are not
 	// the same one. "Is a callback running" is true for every caller in the
 	// process while one runs, and refusing all of them would break correct code
 	// that merely overlapped a rotation. "Is the caller the goroutine that is
-	// inside the callback" is true only for the caller that is genuinely waiting
-	// on itself, which is exactly the set that can never be answered.
+	// inside the callback" is true only for the caller genuinely waiting on
+	// itself, which is exactly the set that can never be answered.
 	inCallback atomic.Uint64
 
 	// adminServer and adminAddrVal are set only when WithAdminHTTP was given to
@@ -215,16 +207,16 @@ func typedPreApply[T any](o *options) (func(context.Context, Change[T]) error, e
 // held as any, exactly like preApply above). It returns (nil, nil) when no
 // hook was installed at all, which is the common case.
 //
-// A hook written against some other T used to make a bare comma-ok assertion
+// A hook written against some other T would make a bare comma-ok assertion
 // yield nil, silently: a nil onChange means the dispatch goroutine's `if
 // e.onChange != nil` guard (start, below) never calls it, so the callback
 // simply never fires - no error, no log, no Status signal that anything was
 // wrong. OnChange is the caller's one mechanism to react to a rotated
 // credential (rotate a database pool, rebuild a client, ...), so that silence
-// costs exactly the notification the caller installed the hook to receive,
-// with nothing anywhere saying so. This returns a loud error instead,
-// wrapping ErrInvalid and naming both types, the same contract typedPreApply
-// already established for the identical shape.
+// would cost exactly the notification the caller installed the hook to
+// receive, with nothing anywhere saying so. This returns a loud error
+// instead, wrapping ErrInvalid and naming both types, the same contract
+// typedPreApply already established for the identical shape.
 func typedOnChange[T any](o *options) (func(Change[T]), error) {
 	if o.onChange == nil {
 		return nil, nil
@@ -237,6 +229,161 @@ func typedOnChange[T any](o *options) (func(Change[T]), error) {
 	return fn, nil
 }
 
+// typedDerive pairs a WithDerive hook, asserted back to its concrete type,
+// with the field paths it declares having written. See WithDerive for what
+// writes means and does not mean.
+type typedDerive[T any] struct {
+	fn     func(*T) error
+	writes []string
+}
+
+// typedDerives asserts the WithDerive hooks back to their concrete type and
+// carries each hook's declared writes through unchanged. Like typedPreApply
+// it is shared by every caller that can observe a mismatch, so none of them
+// can drift into tolerating it.
+//
+// A mismatch is a loud error, matching typedPreApply and typedOnChange. A
+// derive whose type parameter does not match Watch's would otherwise present
+// as "my derived field is empty and nothing told me why", with the hook
+// installed, never invoked, and no signal anywhere. The error names both
+// types so the mistake is findable by grep.
+//
+// A declared write path is validated here, not resolved, and only for shape:
+// an empty or whitespace-only path is rejected outright, naming the
+// offending hook's position (its index among every WithDerive call
+// registered on this options value), because a silently ignored bad path
+// would reintroduce exactly the invisible-field problem writes exists to
+// fix. Validation happens here rather than in WithDerive itself because an
+// Option returns nothing - WithDerive has no way to report an error - so
+// failing at Load/Watch time matches how every other malformed-input case in
+// this package behaves, and matches how the type mismatch just below is
+// already handled.
+//
+// A non-empty path that names no field on T is deliberately NOT validated
+// against T. That is tempting and wrong here: the path is a dotted field
+// path into a possibly nested struct, the same shape spec.Path uses, and no
+// resolver for it exists outside the decode machinery (fieldSpecs, setField)
+// this generic function has no access to. A path matching nothing simply
+// never reports as written later, which degrades to today's (undeclared)
+// behavior rather than misbehaving.
+func typedDerives[T any](o *options) ([]typedDerive[T], error) {
+	if len(o.derives) == 0 {
+		return nil, nil
+	}
+	out := make([]typedDerive[T], 0, len(o.derives))
+	for i, d := range o.derives {
+		fn, ok := d.fn.(func(*T) error)
+		if !ok {
+			var want func(*T) error
+			return nil, fmt.Errorf("mamori: WithDerive hook has type %T, want %T: %w", d.fn, want, ErrInvalid)
+		}
+		for _, w := range d.writes {
+			if strings.TrimSpace(w) == "" {
+				return nil, fmt.Errorf("mamori: WithDerive hook at position %d declares an empty or whitespace-only write path: %w", i, ErrInvalid)
+			}
+		}
+		out = append(out, typedDerive[T]{fn: fn, writes: d.writes})
+	}
+	return out, nil
+}
+
+// hasSpecPath reports whether path names one of specs's own fields - a path a
+// source tag declares and fieldSpecs already discovered, as opposed to an
+// opaque WithDerive write path that names nothing fieldSpecs ever walked.
+//
+// It is shared by derivedFieldChanges and buildReport's derived-append loop
+// (report.go), the two places a WithDerive write path could otherwise produce
+// a second, redundant entry for a path that ALSO carries a source tag - a
+// combination the design spec calls legal ("the derive simply wins"), and one
+// a caller who declares a derive's own INPUT field, rather than its output,
+// can produce by accident. The fieldSpec-driven entry already built for such a
+// path - a FieldChange with a real OldVersion/NewVersion, or a FieldStatus with
+// a real Ref/Scheme/Version - is the one that must survive; a second,
+// Derived-flavored entry appended alongside it would double the path in
+// Change.Fields and Status().Fields alike, and would also be the reason a ref
+// that genuinely rotated stopped being metered (see isDerivedPath, below).
+func hasSpecPath(specs []fieldSpec, path string) bool {
+	for _, s := range specs {
+		if s.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// derivedFieldChanges returns a FieldChange for every declared WithDerive
+// write path whose value differs between oldCfg and newCfg, comparing values
+// with reflect.DeepEqual rather than a per-ref Version - a derived field has
+// none, so there is nothing else to diff.
+//
+// It is the single implementation shared by every place a Change's Fields is
+// built for a derive: buildCandidate's candidate diff and diffApplied's
+// coalesced Unpin diff (both below), and loadValue's initial-load Change
+// (reconcile.go). Sharing it, rather than three independent copies of the same
+// walk, is what keeps those sites from drifting on what counts as a derived
+// field changing.
+//
+// specs is consulted (via hasSpecPath) to skip a declared write path that
+// names a real fieldSpec: that path already gets a version-based FieldChange
+// from the caller's own per-spec loop, and producing a second, value-based one
+// here would duplicate the path in Change.Fields for exactly the legal case
+// the design spec calls "the derive simply wins" - a declared write that also
+// carries a source tag. Without this skip a rotating field named as both would
+// carry two FieldChange entries for the same path, one with real
+// Old/NewVersion and one with neither.
+//
+// A declared path that does not resolve identically on both sides (an unknown
+// field name, a path segment that is not itself a struct, or a field that
+// cannot be read via Interface - e.g. it names an unexported field) is
+// silently skipped rather than reported changed: this mirrors how an
+// undeclared or malformed write path already degrades to invisible everywhere
+// else in this package (see WithDerive's own doc comment), rather than
+// panicking or fabricating a change neither Report nor Status could explain. A
+// path declared by more than one hook is compared only once, on its first
+// declared occurrence, so it can never produce two FieldChange entries for the
+// same path.
+func derivedFieldChanges[T any](oldCfg, newCfg T, derives []typedDerive[T], specs []fieldSpec) []FieldChange {
+	if len(derives) == 0 {
+		return nil
+	}
+	ov := reflect.ValueOf(oldCfg)
+	nv := reflect.ValueOf(newCfg)
+	seen := make(map[string]struct{})
+	var fields []FieldChange
+	for _, d := range derives {
+		for _, p := range d.writes {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			if hasSpecPath(specs, p) {
+				continue
+			}
+			of, ok1 := fieldByPath(ov, p)
+			nf, ok2 := fieldByPath(nv, p)
+			if !ok1 || !ok2 || !of.CanInterface() || !nf.CanInterface() {
+				continue
+			}
+			if reflect.DeepEqual(of.Interface(), nf.Interface()) {
+				continue
+			}
+			// Versions come from the values themselves (derivedVersion,
+			// derivedversion.go), the same content hash Status reports for a
+			// derived field, rather than being left blank. A derived field has
+			// no ref, so there is no provider revision to carry here, but the
+			// caller asked what changed and "" -> "" answers nothing. Both
+			// sides are non-empty and differ, since the DeepEqual above
+			// already established the values differ.
+			fields = append(fields, FieldChange{
+				Path:       p,
+				OldVersion: derivedVersion(of),
+				NewVersion: derivedVersion(nf),
+			})
+		}
+	}
+	return fields
+}
+
 // Watch performs an initial, fail-fast Load of T and then keeps it reconciled at
 // runtime, delivering validated, diff-aware updates to OnChange. It returns after
 // the initial configuration is resolved (OnChange fires only on subsequent
@@ -247,29 +394,32 @@ func Watch[T any](ctx context.Context, opts ...Option) (*Watcher[T], error) {
 		opt(o)
 	}
 
-	// Checked here, before loadValue, so that a mismatched hook is caught
-	// before any provider round trip is spent resolving fields - see
-	// typedPreApply's doc comment for why the mismatch is fatal rather than
-	// tolerated. loadValue itself is called just below (for the initial Load)
-	// and now also runs this same check as part of gating that Load's result
-	// (decision D7); asserting it here again is what buys Watch this earlier,
-	// round-trip-free failure on top of that, not a substitute for it. This
-	// call is also where preApply, below, comes from: it is the value stored
-	// into the engine (e.preApply) for every flush after the initial one, not
-	// merely a discarded probe.
+	// Checked here, before loadValue, so a mismatched hook is caught before any
+	// provider round trip is spent resolving fields - see typedPreApply's doc
+	// comment for why the mismatch is fatal rather than tolerated. loadValue
+	// (called below) runs this same check again as part of gating that Load's
+	// result (decision D7); this earlier call is what buys Watch a round-trip-
+	// free failure on top of that, not a substitute for it. preApply, below, is
+	// the value stored into the engine (e.preApply) for every flush after the
+	// initial one, not merely a discarded probe.
 	preApply, err := typedPreApply[T](o)
 	if err != nil {
 		return nil, err
 	}
 
-	// Checked here for the same reason preApply is checked above: a hook typed
-	// for the wrong T is a caller bug that should fail loudly and immediately,
-	// before any provider round trip is spent, rather than compile clean and
-	// silently install nothing (see typedOnChange's doc comment for what that
-	// used to cost). onChange, unlike preApply, is not fed into loadValue: it
-	// gates nothing on the initial resolve (OnChange fires only on subsequent
-	// changes, per Watch's own doc comment), so this is its only check.
+	// Checked here for the same reason as preApply above. onChange, unlike
+	// preApply, is not fed into loadValue: it gates nothing on the initial
+	// resolve (OnChange fires only on subsequent changes), so this is its
+	// only check.
 	onChange, err := typedOnChange[T](o)
+	if err != nil {
+		return nil, err
+	}
+
+	// Checked here for the identical reason preApply is checked above. derives,
+	// below, is likewise the value stored into the engine (e.derives) for
+	// every flush after the initial one, not merely a discarded probe.
+	derives, err := typedDerives[T](o)
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +452,7 @@ func Watch[T any](ctx context.Context, opts ...Option) (*Watcher[T], error) {
 		sources:   make([][]srcState, len(specs)),
 		onChange:  onChange,
 		preApply:  preApply,
+		derives:   derives,
 		lastGood:  cfg,
 		version:   1, // initial snapshot
 		controlCh: w.control,
@@ -370,6 +521,12 @@ type engine[T any] struct {
 	// anyway - arguments are evaluated before the call, so those two copies of
 	// T are paid hook or no hook.
 	preApply func(context.Context, Change[T]) error
+
+	// derives are the WithDerive hooks, asserted once here rather than on every
+	// flush, paired with each hook's declared write paths (see typedDerive and
+	// typedDerives). A mismatched type parameter fails at Watch time, where it
+	// is findable, rather than silently never running.
+	derives []typedDerive[T]
 
 	// updated only by the reconciler goroutine:
 	observed map[string]Value  // latest value seen per path (always advances)
@@ -898,12 +1055,10 @@ func (e *engine[T]) recomputeWinner(specIdx int) (val Value, pos int, err error)
 // letting the lower one win.
 //
 // It is called only for a genuine chain (len(spec.Refs) > 1): a single-ref
-// field has no lower position to race against, so it is left fully
-// unseeded, with no extra provider round trip, matching today's behavior
-// exactly. This costs one additional resolve per position up to whichever
-// one stops the walk, paid once at Watch startup, only for chains - the same
-// documented tradeoff resolveAll already accepts for chain resolution
-// generally (see its doc comment: "correct now beats clever later").
+// field has no lower position to race against and is left unseeded, with no
+// extra round trip. This costs one resolve per position up to whichever stops
+// the walk, paid once at Watch startup, the same tradeoff resolveAll already
+// accepts for chains.
 //
 // Errors are stored raw, via the provider's own Resolve rather than
 // resolveRef, so they carry no extra wrapping here: recomputeWinner's
@@ -978,7 +1133,7 @@ func (e *engine[T]) seedChainSources(ctx context.Context, spec fieldSpec) []srcS
 // handleChainNotFound applies a field's not-found handling when
 // recomputeWinner reports every position in its chain absent (or not yet
 // reporting in - see recomputeWinner's doc comment). This is unconditional
-// on OnFail: resolveChain's case 4 (Task 2) and this runtime counterpart
+// on OnFail: resolveChain's case 4 and this runtime counterpart
 // both treat "every position not found" as ordinary absence, governed only
 // by default:/optional, never by onfail (which exists only for a
 // non-not-found terminal error).
@@ -1091,6 +1246,46 @@ func (e *engine[T]) buildCandidate() (cand T, fields []FieldChange, err error) {
 			return cand, nil, ve
 		}
 	}
+	// Same position as the Load path: after decode, before validation, before
+	// the PreApply gate. See WithDerive.
+	//
+	// A derive hook runs INLINE on the reconciler goroutine, the same position
+	// runPreApply's PreApply hook and emitErr's OnError callback occupy, so it
+	// needs the identical reentrancy guard: Refresh, Pin, PinCurrent or Unpin
+	// called from inside one would ask this very goroutine to service a command
+	// it cannot receive until the hook returns, which otherwise wedges until
+	// Close (see armReentrancy, preapply.go, and ErrReentrantCall). Unlike
+	// PreApply, a derive hook takes no context.Context at all, so there is no
+	// timeout to escape on either.
+	//
+	// Guarded on len(e.derives) > 0 so the goroutineID lookup (a runtime.Stack
+	// walk) is never paid by a watcher configured with no derive hooks.
+	//
+	// The disarm is deferred inside the IIFE below rather than called
+	// explicitly on each return path: deferring is what makes the mark's
+	// lifetime a property of THIS call rather than of the hook's cooperation,
+	// so a derive hook that panics cannot leave the mark set and wedge every
+	// later Pin/Refresh/PinCurrent/Unpin call. The IIFE also keeps the mark
+	// scoped to exactly this loop, rather than left armed through validation
+	// below.
+	if len(e.derives) > 0 {
+		de := func() (de *DeriveError) {
+			defer armReentrancy(&e.w.inCallback)()
+			for _, d := range e.derives {
+				if err := d.fn(&cand); err != nil {
+					e.o.meter.RecordApplyRejected(RejectDerive)
+					e.o.log().Error("candidate rejected by a derive hook; continuing to serve the previous config",
+						errAttrs(err)...)
+					return &DeriveError{Err: err}
+				}
+			}
+			return nil
+		}()
+		if de != nil {
+			e.emitErr(de)
+			return cand, nil, de
+		}
+	}
 	if err := e.o.validator.Validate(cand); err != nil {
 		ve := &ValidationError{Err: err}
 		e.o.meter.RecordApplyRejected(RejectValidation)
@@ -1114,6 +1309,14 @@ func (e *engine[T]) buildCandidate() (cand T, fields []FieldChange, err error) {
 			e.applied[spec.Path] = v.Version
 		}
 	}
+	// A declared derive write path has no ref and so no fieldSpec, which is
+	// why it never shows up in the loop above; append its own diff here,
+	// comparing the value at each declared path in the previously-applied
+	// config against the same path in cand (already carrying whatever the
+	// derive loop above just wrote to it). See derivedFieldChanges for why
+	// this is the single implementation shared with diffApplied and
+	// loadValue's initial-load Change, rather than a copy of the same walk.
+	fields = append(fields, derivedFieldChanges(e.lastGood, cand, e.derives, e.specs)...)
 	return cand, fields, nil
 }
 
@@ -1195,14 +1398,15 @@ func (e *engine[T]) flush(ctx context.Context, pending map[string]struct{}) erro
 	// value that was refused breaks the engine in two ways at once:
 	//
 	// The next flush would diff the rejected version against itself, come up
-	// empty, and return ok == false. The rejected value would never be retried,
-	// no further error would ever be emitted, and Get would serve the
-	// superseded configuration indefinitely. (Status reports the watcher
-	// healthy through a refusal either way: emitErr does not set e.lastErr, so
-	// buildReport sees nothing wrong, exactly as it does not for a validation
-	// failure. What the rollback restores is the retry, and with it an error on
-	// every subsequent attempt; without it even the errors stop, which is what
-	// makes the staleness silent rather than merely undesired.)
+	// empty, and return nil having found nothing new to apply. The rejected
+	// value would never be retried, no further error would ever be emitted,
+	// and Get would serve the superseded configuration indefinitely. (Status
+	// reports the watcher healthy through a refusal either way: emitErr does
+	// not set e.lastErr, so buildReport sees nothing wrong, exactly as it does
+	// not for a validation failure. What the rollback restores is the retry,
+	// and with it an error on every subsequent attempt; without it even the
+	// errors stop, which is what makes the staleness silent rather than
+	// merely undesired.)
 	//
 	// And the refused value is not withdrawn from e.observed, so it stays in
 	// every candidate built afterwards. Hidden from the diff, it rides into the
@@ -1250,7 +1454,14 @@ func (e *engine[T]) flush(ctx context.Context, pending map[string]struct{}) erro
 		// and emits the coalesced Change, it does not reconcile anything
 		// itself, so it must not (and does not) call RecordRefresh again for
 		// these same fields.
+		//
+		// A derived FieldChange is skipped here (isDerivedPath), not metered
+		// under a fabricated scheme: see isDerivedPath's own doc comment for
+		// why.
 		for _, f := range fields {
+			if e.isDerivedPath(f.Path) {
+				continue
+			}
 			e.o.meter.RecordRefresh(e.schemeForPath(f.Path))
 		}
 		e.w.report.Store(e.buildReport())
@@ -1259,10 +1470,23 @@ func (e *engine[T]) flush(ctx context.Context, pending map[string]struct{}) erro
 
 	e.w.cfg.Store(&cand)
 	for _, f := range fields {
+		if e.isDerivedPath(f.Path) {
+			continue
+		}
 		e.o.meter.RecordRefresh(e.schemeForPath(f.Path))
 	}
 	e.o.log().Info("config change applied", logAttrCount, len(fields))
 	for _, f := range fields {
+		// A derived FieldChange does carry a Version (derivedFieldChanges,
+		// above, hashes both sides), but it is a content hash of the value,
+		// not a backend revision, and this log line pairs with the refresh
+		// metering above: both describe a field mamori resolved from a
+		// provider, which a derived field never is. isDerivedPath is the same
+		// check the metering loops use, so the two can never disagree about
+		// which fields in this same slice are derived.
+		if e.isDerivedPath(f.Path) {
+			continue
+		}
 		e.o.log().Debug("field updated",
 			logAttrField, f.Path, logAttrVersion, f.NewVersion)
 	}
@@ -1287,10 +1511,11 @@ func (e *engine[T]) flush(ctx context.Context, pending map[string]struct{}) erro
 // still reports not-pinned.
 //
 // Every branch replies exactly once, and the structure is what guarantees it
-// rather than four (now five) separate promises: each case only assigns to
-// reply, and the single send below every case is the only send in the function.
-// A command that went unanswered would leave its caller blocked until the
-// watcher closes - Pin and Unpin have no context to escape on at all, and
+// rather than a separate reply statement in each of the four branches: each
+// case only assigns to reply, and the single send below every case is the
+// only send in the function. A command that went unanswered would leave its
+// caller blocked until the watcher closes - Pin and Unpin have no context to
+// escape on at all, and
 // Refresh's is the caller's, not a deadline this could rely on - so "reply
 // exactly once" is enforced here by there being exactly one reply statement.
 //
@@ -1356,7 +1581,7 @@ func (e *engine[T]) handlePin(ctx context.Context, cmd pinCmd) {
 		old := e.pinnedConfig
 		newCfg := e.lastGood
 		e.w.cfg.Store(&newCfg)
-		fields := e.diffApplied(e.pinnedApplied, e.applied)
+		fields := e.diffApplied(e.pinnedApplied, e.applied, old, newCfg)
 		if len(fields) > 0 {
 			e.enqueue(Change[T]{Old: old, New: newCfg, Fields: fields})
 		}
@@ -1532,13 +1757,23 @@ func (e *engine[T]) findSnapshot(version uint64) (Snapshot[T], bool) {
 }
 
 // diffApplied returns a FieldChange for every path whose applied version in
-// after differs from before, in spec order for a deterministic result. It is
-// the counterpart, at Unpin time, to the diff buildCandidate performs on
-// every flush: buildCandidate advances e.applied one flush at a time
-// (pinned or not), and diffApplied collapses however many of those steps
-// happened while pinned into the single accumulated diff Unpin emits, so
-// several Sets while pinned still produce exactly one Change.
-func (e *engine[T]) diffApplied(before, after map[string]string) []FieldChange {
+// after differs from before, in spec order for a deterministic result, plus
+// one for every declared derive write path whose value differs between
+// oldCfg and newCfg. It is the counterpart, at Unpin time, to the diff
+// buildCandidate performs on every flush: buildCandidate advances e.applied
+// one flush at a time (pinned or not), and diffApplied collapses however many
+// of those steps happened while pinned into the single accumulated diff
+// Unpin emits, so several Sets while pinned still produce exactly one
+// Change.
+//
+// oldCfg and newCfg are the full configs diffApplied's own version-map diff
+// cannot get a derived value out of - before/after carry only per-ref
+// Versions, and a derived field has none. They are the pinned and live
+// configs at Unpin (handlePin's own e.pinnedConfig and e.lastGood), the same
+// two ends the version-map diff already spans; see derivedFieldChanges for
+// why this is the identical comparison buildCandidate performs, not a second
+// implementation of it.
+func (e *engine[T]) diffApplied(before, after map[string]string, oldCfg, newCfg T) []FieldChange {
 	var fields []FieldChange
 	for _, spec := range e.specs {
 		b, a := before[spec.Path], after[spec.Path]
@@ -1546,6 +1781,7 @@ func (e *engine[T]) diffApplied(before, after map[string]string) []FieldChange {
 			fields = append(fields, FieldChange{Path: spec.Path, OldVersion: b, NewVersion: a})
 		}
 	}
+	fields = append(fields, derivedFieldChanges(oldCfg, newCfg, e.derives, e.specs)...)
 	return fields
 }
 
@@ -1619,14 +1855,12 @@ func (e *engine[T]) enqueue(ev Change[T]) {
 //
 // That inline delivery puts an OnError callback in the same position a PreApply
 // hook is in, so it is marked the same way. A callback that calls Pin,
-// PinCurrent, Unpin or Refresh on this watcher is asking the goroutine it is
-// currently occupying to service a command, and before this mark existed on this
-// path that blocked until Close, silently, with no reconciliation in between -
-// verified, not theorized: see TestRefreshFromInsideOnErrorFailsFast and
-// TestPinFromInsideOnErrorFailsFast, both of which time out rather than fail
-// without the arming below. "The reload was rejected, retry it" is a natural
-// thing to write in an OnError callback and Refresh is how you would write it,
-// which is what makes this the more tempting of the two callbacks to get wrong.
+// PinCurrent, Unpin or Refresh on this watcher would ask the goroutine it is
+// currently occupying to service a command, which without this mark blocks
+// until Close, silently, with no reconciliation in between. "The reload was
+// rejected, retry it" is a natural thing to write in an OnError callback and
+// Refresh is how you would write it, which is what makes this the most
+// tempting of the three inline callbacks to get wrong.
 //
 // The mark is armed only when a callback actually exists, and this is an error
 // path rather than a per-flush one - buildCandidate's validation failures,
@@ -1639,6 +1873,31 @@ func (e *engine[T]) emitErr(err error) {
 	}
 	defer armReentrancy(&e.w.inCallback)()
 	e.o.onError(err)
+}
+
+// isDerivedPath reports whether path can only have reached this flush's
+// Change.Fields through derivedFieldChanges - equivalently (see hasSpecPath),
+// whether path names no fieldSpec on this engine's T. flush uses this to skip
+// a derived FieldChange in its metering and per-field debug logging, rather
+// than recording a refresh under an empty scheme label: schemeForPath returns
+// "" for any path outside e.specs, and RecordRefresh's own contract - "a
+// watched value changed and was reconciled" - does not describe a derive
+// rebuild, since a derived field is never watched.
+//
+// This is a structural test on the FieldChange's ORIGIN - does it have a
+// fieldSpec - not a name lookup against a WithDerive hook's writes list. A
+// name-based check gets this wrong for a declared write path that ALSO names
+// a source-tagged field (the legal "derive simply wins" case): that path's
+// FieldChange comes from the per-spec loop in buildCandidate, carrying a real
+// OldVersion/NewVersion, but a name-based check would still flag it as
+// derived purely because the path appears in some hook's writes - silently
+// dropping the refresh metric and "field updated" log for a ref that
+// genuinely rotated. Checking e.specs directly cannot make that mistake:
+// derivedFieldChanges never produces an entry for a path already in e.specs
+// (via hasSpecPath), so the two loops can never both contribute an entry for
+// the same path.
+func (e *engine[T]) isDerivedPath(path string) bool {
+	return !hasSpecPath(e.specs, path)
 }
 
 // schemeForPath returns the scheme of the ref that most recently determined

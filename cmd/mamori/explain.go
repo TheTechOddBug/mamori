@@ -58,11 +58,37 @@ func explainCmd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Drop validate-only fields once, here, so the table and the JSON agree.
+	// explain lists what mamori reads, and a field the application populates
+	// itself has no ref to list. Filtering only the table would leak it into
+	// --json, which is what "mamori diff" consumes.
+	structs = withoutValidateOnly(structs)
+
 	if jsonOut {
 		return writeExplainJSON(stdout, stderr, structs)
 	}
 	writeExplainTable(stdout, structs)
 	return 0
+}
+
+// withoutValidateOnly returns structs with every KindValidate field removed.
+// It copies rather than filtering in place: Extract's result is shared with no
+// one today, but explain is the only command that wants this narrowing, and a
+// mutating filter here would be a trap for the next caller added.
+func withoutValidateOnly(structs []StructInfo) []StructInfo {
+	out := make([]StructInfo, 0, len(structs))
+	for _, s := range structs {
+		kept := make([]Field, 0, len(s.Fields))
+		for _, f := range s.Fields {
+			if f.Kind == KindValidate {
+				continue
+			}
+			kept = append(kept, f)
+		}
+		s.Fields = kept
+		out = append(out, s)
+	}
+	return out
 }
 
 // parseExplainArgs splits args into package patterns and the --type/--json
@@ -148,5 +174,21 @@ func writeExplainTable(stdout io.Writer, structs []StructInfo) {
 				strconv.FormatBool(f.Optional), strconv.FormatBool(f.Sensitive))
 		}
 		_ = tw.Flush()
+
+		if s.DerivesIncomplete {
+			_, _ = fmt.Fprint(stdout, derivesIncompleteNote)
+		}
 	}
 }
+
+// derivesIncompleteNote is printed after a struct's table when
+// StructInfo.DerivesIncomplete is true. Silent under-reporting would make an
+// incomplete derived-field listing look complete, which is worse than
+// admitting the gap: at least one WithDerive call targeting this struct
+// declared a write path findDerives could not read statically (derives.go),
+// so the KindDerived rows already printed above may not be every field that
+// struct's hooks actually write.
+const derivesIncompleteNote = `note: this struct declares WithDerive write paths that could not be read
+      statically (a variable or a slice expansion); the derived fields listed
+      above may be incomplete
+`

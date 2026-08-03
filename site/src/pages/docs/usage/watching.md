@@ -36,6 +36,8 @@ cfg := w.Get() // lock-free atomic snapshot; always the last valid config
 
 `OnChange` receives a `Change[T]` carrying `Old` and `New` full snapshots plus `Fields []FieldChange{Path, OldVersion, NewVersion}`. Use `Changed(path string) bool` to react to one field:
 
+A [`WithDerive`](/docs/usage/derived-fields/)-declared field appears in `Fields` like any other when its rebuilt value changes. Its versions are content hashes of the value rather than provider revisions, since it has no ref.
+
 ```go
 mamori.OnChange(func(ev mamori.Change[Config]) {
 	if ev.Changed("DBPassword") {
@@ -46,25 +48,33 @@ mamori.OnChange(func(ev mamori.Change[Config]) {
 
 ## Handle errors with OnError
 
-`OnError` receives runtime resolve and validation errors without stopping the watcher. Use it for metrics and alerting; `Get()` keeps serving the last good config.
+`OnError` receives every runtime failure without stopping the watcher. Use it for metrics and alerting; `Get()` keeps serving the last good config.
+
+Five typed errors reach it, and they mean different things, so classify rather than counting them together: `*ProviderError` (a ref failed to resolve), `*ValidationError` (the candidate failed `validate:` tags), `*DeriveError` (a [`WithDerive`](/docs/usage/derived-fields/) hook returned an error), `*PreApplyError` (a [`PreApply`](/docs/usage/rotation/) gate refused the candidate, including on timeout), and `*StaleError` (a ref went unrefreshed past `WithStale`).
 
 ```go
 mamori.OnError(func(err error) {
 	var verr *mamori.ValidationError
-	if errors.As(err, &verr) {
+	var derr *mamori.DeriveError
+	switch {
+	case errors.As(err, &verr):
 		metrics.Inc("config_validation_error")
-		return
+	case errors.As(err, &derr):
+		metrics.Inc("config_derive_error")
+	default:
+		metrics.Inc("config_error")
 	}
-	metrics.Inc("config_error")
 })
 ```
+
+The middle three all mean the same thing operationally: a candidate was built and rejected, so the config you are serving is older than the backend's. `*ProviderError` means a resolve failed. `*StaleError` means a ref has gone too long without a fresh value, not that it never had one: the last good value is still being served, which is exactly why the age is worth alerting on.
 
 ## What you can rely on
 
 These behaviors are guaranteed and covered by the conformance kit.
 
 - **Validated, all-or-nothing updates.** `OnChange` fires with a fully re-validated snapshot. If a new value fails validation the update is rejected: `Get()` keeps returning the last good config and `OnError` receives a `*ValidationError`.
-- **A gate before the swap, if you install one.** A candidate is built, then validated, then - if `PreApply` was installed - handed to it for a check that needs I/O (a rotated password actually opens a connection). Only after that gate passes does the atomic swap happen and `OnChange` fire. See [Rotation safety](/docs/usage/rotation/).
+- **A gate before the swap, if you install one.** A candidate is built, then any `WithDerive` hooks run, then it is validated, then - if `PreApply` was installed - handed to it for a check that needs I/O (a rotated password actually opens a connection). Only after that gate passes does the atomic swap happen and `OnChange` fire. See [Rotation safety](/docs/usage/rotation/) and [Derived fields](/docs/usage/derived-fields/).
 - **OnChange is called one at a time.** Callbacks are serialized, so your callback never runs concurrently with itself. The dispatch queue absorbs bursts, so a slow callback just delays the next event; only once a handler stays slower than the change rate for long enough to fill the queue does it overflow, and the oldest queued event is dropped. See [Tuning the dispatch queue](#tuning-the-dispatch-queue) below.
 - **Coalesced events.** Field changes within a debounce window (default 500ms, override per field with `?debounce=`) produce a single `Change`. A JSON secret with five keys rotating is one event, not five. See the [Options reference](/docs/usage/options/) for this and every other tuning knob's default.
 - **Last-good on failure.** On a runtime resolve failure the last-good value is retained, `OnError` receives a `*ProviderError`, and the ref keeps being retried - on the poll interval by default, or with per-ref exponential backoff if you opt into it with [`WithBackoff`](#retry-backoff). `WithStale(maxAge)` escalates prolonged staleness to a hard `*StaleError`.

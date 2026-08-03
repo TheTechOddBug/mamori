@@ -218,6 +218,8 @@ go test -tags preflight ./...
 
 Unlike `Load`, `Doctor` never aborts on the first failure, so one run reports every misconfigured ref. See [Doctor](/docs/observability/doctor/) for the full `Report` shape.
 
+`Doctor` also runs your `WithDerive` hooks, so a hook that errors, or one typed for the wrong config, fails this preflight too. A hook that panics is not recovered: it crashes the test process rather than producing a row, so `go test` still catches it, just not through the loop above. See [Doctor: pre-deploy check](/docs/observability/doctor/#derived-fields-are-probed) for the four outcomes a derived row can report.
+
 ## Drive poll intervals with the fake clock
 
 `mamoritest.Provider` delivers changes natively, not on a poll timer. To drive time itself (for example, testing `mamori.WithPollInterval` against a provider that only polls), inject `mamori.NewFakeClock` with `mamori.WithClock` and advance it manually:

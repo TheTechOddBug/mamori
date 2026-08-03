@@ -18,6 +18,17 @@ const (
 	defaultJitter       = 0.2
 )
 
+// deriveEntry holds one WithDerive hook alongside the field paths it declares
+// having written. fn is stored as any (options is not generic, the same
+// reason preApply and onChange are); writes stays on this non-generic side
+// deliberately, because it is just strings, and it lets the reconciler read
+// the declared paths without ever needing to know T (see typedDerive and
+// typedDerives, reconciler.go).
+type deriveEntry struct {
+	fn     any
+	writes []string
+}
+
 // options holds all configuration for a Load or Watch call.
 type options struct {
 	providers    map[string]Provider // explicit providers, override the registry
@@ -47,6 +58,20 @@ type options struct {
 	preApply        any
 	preApplyTimeout time.Duration
 
+	// derives holds the WithDerive hooks in registration order. Each entry
+	// pairs the hook (a func(*T) error typed per T and stored as any, for the
+	// same reason preApply above is) with the field paths it declares having
+	// written (see deriveEntry). They run after fields are decoded and BEFORE
+	// validation, so a derived field is validated like any other, and before
+	// the PreApply gate, so a rotation-safety hook proves the derived value
+	// rather than the one it replaced.
+	//
+	// A slice rather than a single hook: unrelated derivations stay in separate
+	// functions instead of accreting into one closure, and a field derived from
+	// another derived field works with no new concept, because a later hook sees
+	// an earlier one's output.
+	derives []deriveEntry
+
 	// admin server config, consumed only by Watch (see adminhttp.go). Load
 	// accepts the same Option values but has no watcher to run a server
 	// against, so it ignores all three.
@@ -67,10 +92,9 @@ type options struct {
 // defaultOptions returns the option set every Load and Watch starts from.
 //
 // backoffBase/backoffMax are deliberately absent, leaving the retry backoff
-// window at zero: backoff is opt-in via WithBackoff. This used to name 1s/1m
-// here while nothing in the engine read either field, so those numbers never
-// described real behavior; adopting them once the option was implemented would
-// have changed the retry cadence of every existing caller. See WithBackoff.
+// window at zero: backoff is opt-in via WithBackoff. Giving them a nonzero
+// default here would silently turn backoff on for every existing caller and
+// change their retry cadence without them asking for it. See WithBackoff.
 func defaultOptions() *options {
 	return &options{
 		providers:       map[string]Provider{},
@@ -153,12 +177,9 @@ func WithHistory(n int) Option {
 // that delay, held at max once it gets there. Any successful round trip with
 // the backend resets it, and the ref returns to the normal poll interval.
 //
-// Backoff is OFF by default. Without this option a failing ref is retried on
-// the WithPollInterval cadence, exactly as it always has been - which is the
-// point: this option set two fields nothing read until it was implemented, so
-// no existing caller can have been relying on backoff, and switching it on for
-// everyone would have made a just-failed backend get retried far sooner than
-// its operators had ever seen. Choose the window deliberately.
+// Backoff is OFF by default: without this option a failing ref is retried on
+// the plain WithPollInterval cadence. Choose the window deliberately, since
+// turning it on changes how soon a just-failed backend gets retried.
 //
 // Normalization: a base of zero or less disables backoff, so WithBackoff(0, 0)
 // turns it back off. A max below base is raised to base, which gives
@@ -199,7 +220,7 @@ func WithMeter(m Meter) Option { return func(o *options) { o.meter = m } }
 func WithTracer(t Tracer) Option { return func(o *options) { o.tracer = t } }
 
 // OnError installs a callback for runtime resolve/validation/stale errors, and
-// for a candidate a PreApply gate rejected.
+// for a candidate a PreApply gate or a WithDerive hook rejected.
 //
 // Unlike OnChange, it runs INLINE on the reconciler goroutine rather than on the
 // dispatch queue: errors are delivered, never dropped, which the drop-oldest
@@ -218,6 +239,76 @@ func WithTracer(t Tracer) Option { return func(o *options) { o.tracer = t } }
 // the tempting thing to write here; issue it from another goroutine, or let the
 // next reconciliation do it.
 func OnError(fn func(error)) Option { return func(o *options) { o.onError = fn } }
+
+// WithDerive installs a hook that computes fields from already-resolved fields.
+// It runs on every Load and every reconciled update, after values are decoded
+// into the struct and before validation, so a value assembled from other fields
+// is rebuilt whenever any of its inputs changes rather than going stale.
+//
+// The canonical case is a DSN assembled from a host, a user, and a rotating
+// password. Built once in application code after Get, such a value is silently
+// wrong the moment the password rotates; built here, it is rebuilt on every
+// applied update and proven by any PreApply gate before Get serves it.
+//
+//	mamori.WithDerive(func(c *Config) error {
+//	    c.DSN = secret.NewString((&url.URL{
+//	        Scheme: "postgres",
+//	        User:   url.UserPassword(c.User, c.Password.Reveal()),
+//	        Host:   c.Host,
+//	        Path:   "/" + c.DB,
+//	    }).String())
+//	    return nil
+//	})
+//
+// Escaping and secret hygiene are the caller's: net/url escapes a password
+// containing '@' or '/' correctly, and assigning into a secret.String keeps the
+// assembled value redacted in fmt, JSON, and slog.
+//
+// Unlike PreApply, the hook takes no context.Context. PreApply does I/O to
+// prove a credential; a derive is a pure transformation of an already-resolved
+// struct, and the missing parameter is how the API says so.
+//
+// It must not call back into the same Watcher. Get is safe (a lock-free atomic
+// load), but Pin, PinCurrent, Unpin, and Refresh are serviced by the very
+// goroutine this hook occupies, so they would wait for themselves; mamori
+// refuses them instead - see [ErrReentrantCall] for what each returns. There is
+// no context here to bound the wait either. Issue the call from another
+// goroutine, or let the next reconciliation carry it.
+//
+// Multiple calls run in registration order. Returning an error rejects the
+// whole candidate configuration exactly as a validation failure does: Get keeps
+// serving the last valid config and the error reaches OnError as a *DeriveError.
+//
+// writes declares the dotted field paths the hook writes (the same shape
+// spec.Path uses, e.g. "Redis.DSN"), in any order. mamori cannot infer what an
+// opaque Go function assigns, so the caller states it, and declaring it is what
+// lets a derived field appear in ev.Changed and in Status()'s per-field report.
+// It is variadic and optional: WithDerive(fn) still registers and runs the
+// hook, it simply reports no writes.
+//
+// A declared path is validated for shape, not existence. An empty or
+// whitespace-only path is rejected at Load/Watch time (see typedDerives), since
+// silently ignoring one reintroduces the invisible-field problem writes exists
+// to fix. A path that names no field on T is NOT rejected: mamori has no
+// resolver for it outside the decode machinery this hook's opaqueness keeps it
+// from running, so such a path simply never reports as written.
+//
+// A nil fn installs nothing and is silently dropped, the same clamp WithHistory
+// and WithPreApplyTimeout apply.
+func WithDerive[T any](fn func(*T) error, writes ...string) Option {
+	return func(o *options) {
+		if fn == nil {
+			return
+		}
+		// Copy writes rather than storing the caller's slice. A variadic call
+		// site spelled WithDerive(fn, paths...) passes its own backing array, so
+		// storing it directly leaves the caller holding a live alias to the
+		// declared paths. Mutating it after Watch would change what the
+		// reconciler goroutine reads while it reads it, which is a data race as
+		// well as a silent change to what the hook claims to write.
+		o.derives = append(o.derives, deriveEntry{fn: fn, writes: append([]string(nil), writes...)})
+	}
+}
 
 // provider resolves the provider for a scheme, preferring explicit providers
 // over the global registry.
@@ -261,6 +352,16 @@ func loadValue[T any](ctx context.Context, o *options) (T, []resolved, error) {
 	if err != nil {
 		return cfg, nil, err
 	}
+	// Checked here too, for the identical reason: a mismatched WithDerive hook
+	// is the same kind of caller bug as a mismatched PreApply one, and must
+	// fail before resolveAll spends a round trip, not after. Running this check
+	// only after resolveAll and buildInto would let a failing resolve mask the
+	// mismatch entirely and cost a full round of provider round trips first.
+	// See typedDerives's doc comment.
+	derives, err := typedDerives[T](o)
+	if err != nil {
+		return cfg, nil, err
+	}
 
 	t := reflect.TypeOf(cfg)
 	specs, err := fieldSpecs(t, o.refVars)
@@ -274,6 +375,16 @@ func loadValue[T any](ctx context.Context, o *options) (T, []resolved, error) {
 	if err := buildInto(reflect.ValueOf(&cfg).Elem(), res, o.decodeHooks); err != nil {
 		return cfg, nil, err
 	}
+	// Derives run here, after decode and before validation, so a derived field
+	// is validated on its derived value rather than the zero value it held a
+	// moment ago. See WithDerive for why this position and not after. The type
+	// assertion itself already happened above, before resolveAll; this loop
+	// only invokes the hooks.
+	for _, d := range derives {
+		if err := d.fn(&cfg); err != nil {
+			return cfg, nil, &DeriveError{Err: err}
+		}
+	}
 	if err := o.validator.Validate(cfg); err != nil {
 		return cfg, nil, &ValidationError{Err: err}
 	}
@@ -284,30 +395,23 @@ func loadValue[T any](ctx context.Context, o *options) (T, []resolved, error) {
 	// first rotation. Old is the zero value of T here, since nothing was
 	// serving yet.
 	//
-	// Fields is populated, not left nil, and it is populated by applying the
-	// engine's own diff rule (buildCandidate, reconciler.go) against the true
-	// prior state at this point in time: e.applied does not exist yet (Watch
-	// only seeds it after loadValue returns), so the prior version for every
-	// field is the empty string, and buildCandidate already treats a missing
-	// applied entry and an explicit "" identically (see flush's own comment on
-	// that equivalence). Applying that same rule here yields one FieldChange
-	// per resolved field, each with OldVersion "" - exactly what buildCandidate
-	// would compute one instant later, were e.applied queried before Watch
-	// seeds it. This is what makes ev.Changed(path) true for every field set on
-	// this load, which is what lets a hook written the documented way (guard on
-	// ev.Changed before doing the I/O) verify the initial configuration at all
-	// - the entire point of D7. See TestPreApplyInitialLoadPopulatesFields.
+	// Fields is populated, not left nil, using the same diff rule buildCandidate
+	// applies (reconciler.go) against the true prior state at this point: no
+	// field has an applied version yet, and buildCandidate already treats a
+	// missing applied entry the same as an explicit "". That yields one
+	// FieldChange per resolved field, each with OldVersion "" - exactly what
+	// buildCandidate would compute an instant later - which is what makes
+	// ev.Changed(path) true for every field on this load, the property a
+	// PreApply hook needs to verify the initial configuration at all.
 	//
 	// This is the only place either Load or Watch's initial resolve runs the
 	// gate: Watch stores this call's result directly into the engine's
-	// lastGood/cfg without a further gate of its own (see Watch in
-	// reconciler.go), so gating here costs exactly one hook invocation for the
-	// initial configuration, not two.
-	// Guarded on the hook, because nothing else ever reads this slice: it exists
-	// solely to populate the Change handed to the gate. Without the guard every
-	// Load and every Watch allocates one FieldChange per resolved field for a
-	// hook that is not there - which is the common case, since PreApply is
-	// opt-in.
+	// lastGood/cfg without a further gate of its own, so gating here costs
+	// exactly one hook invocation for the initial configuration, not two.
+	// Guarded on the hook being non-nil, since nothing else reads this slice:
+	// without the guard every Load and every Watch would allocate one
+	// FieldChange per resolved field for a hook that is not there, the common
+	// case since PreApply is opt-in.
 	var fields []FieldChange
 	if hook != nil {
 		for _, r := range res {
@@ -315,6 +419,15 @@ func loadValue[T any](ctx context.Context, o *options) (T, []resolved, error) {
 				fields = append(fields, FieldChange{Path: r.spec.Path, NewVersion: r.value.Version})
 			}
 		}
+		// A declared derive write path carries no ref and no Version, so the
+		// loop above never sees it; append its own diff here, comparing the
+		// zero value of T (nothing was serving before this load) against cfg,
+		// which already carries whatever the derive loop just above wrote to
+		// it. See derivedFieldChanges for why this is the identical comparison
+		// buildCandidate and diffApplied perform for a reconciled update, not a
+		// second implementation of it.
+		var zero T
+		fields = append(fields, derivedFieldChanges(zero, cfg, derives, specs)...)
 	}
 	// The reentrancy mark is nil here, and that is not an oversight: this gate
 	// runs on the CALLER's goroutine, inside Load or inside Watch before it has
