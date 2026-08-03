@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.7.0](https://github.com/xavidop/mamori/compare/v1.6.2...v1.7.0) (2026-08-03)
+
+
+### Features
+
+* **core:** WithDerive, computed fields that stay correct across rotation ([#112](https://github.com/xavidop/mamori/issues/112)) ([d066a37](https://github.com/xavidop/mamori/commit/d066a37a9166c7b48f587b2fc4869a2fbf9dc074))
+
 ## [1.6.2](https://github.com/xavidop/mamori/compare/v1.6.1...v1.6.2) (2026-08-01)
 
 
