@@ -22,7 +22,7 @@ go get github.com/xavidop/mamori/x/prom
 
 ## What it does
 
-`New` wraps a `prometheus.Registerer` and registers six instruments, recording
+`New` wraps a `prometheus.Registerer` and registers seven instruments, recording
 to them as mamori resolves and reconciles config. It is safe for concurrent
 use.
 
@@ -85,6 +85,7 @@ panic.
 | Stale count | `mamori_stale_total` | Counter | - | `scheme` |
 | Change dropped count | `mamori_change_dropped_total` | Counter | - | none |
 | Apply rejected count | `mamori_apply_rejected_total` | Counter | - | `reason` (`validation` \| `preapply` \| `derive`) |
+| Bootstrap write failed | `mamori_bootstrap_write_failed_total` | Counter | - | none |
 
 - `scheme` is the provider scheme of the resolved ref (e.g. `file`, `aws-sm`,
   `vault`).
@@ -105,6 +106,10 @@ panic.
 - `reason` on the apply-rejected counter is `mamori.RejectReason`, a closed set
   of three values (`validation`, `preapply`, `derive`) so it stays a safe,
   bounded metric label.
+- `mamori_bootstrap_write_failed_total` is fed through `mamori.BootstrapMeter`,
+  an optional interface this bridge implements, so the counter is recorded with
+  nothing extra to do. A sink implementing only `mamori.Meter` keeps working and
+  never sees this event.
 
 **Seconds, not milliseconds.** `mamori_resolve_duration_seconds` records in
 seconds, following Prometheus convention for a duration histogram
@@ -136,8 +141,9 @@ This matters for two reasons at once:
 
 `x/prom` never accepts a ref or a resolved value as an argument in the first
 place: `mamori.Meter`'s methods take only a `scheme`, a `time.Duration`, an
-`error`, or a `mamori.RejectReason`, so there is no plumbing through which
-either could reach a label.
+`error`, or a `mamori.RejectReason` (and `mamori.BootstrapMeter`'s takes
+nothing at all), so there is no plumbing through which either could reach a
+label.
 
 ## Development
 

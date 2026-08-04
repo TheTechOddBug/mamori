@@ -57,6 +57,13 @@ const (
 	// refused before being applied, labeled "reason" (see mamori.RejectReason:
 	// "validation", "preapply", or "derive").
 	MetricApplyRejectedTotal = "mamori_apply_rejected_total"
+	// MetricBootstrapWriteFailedTotal is a counter of WithBootstrapCache
+	// snapshot writes that failed after an otherwise good configuration was
+	// applied. It carries no labels: there is one snapshot file per process. A
+	// non-zero rate means the process is running without the cold-start
+	// fallback it was configured to have, and nothing else will say so until a
+	// restart finds nothing to fall back to.
+	MetricBootstrapWriteFailedTotal = "mamori_bootstrap_write_failed_total"
 )
 
 // Metric label names.
@@ -79,21 +86,29 @@ const (
 )
 
 // meter implements mamori.Meter on top of Prometheus client_golang
-// instruments registered against a single prometheus.Registerer.
+// instruments registered against a single prometheus.Registerer, plus the
+// optional mamori.BootstrapMeter.
 //
 // It is safe for concurrent use: every underlying Prometheus instrument is
 // concurrency-safe, and the struct is immutable after construction.
 type meter struct {
-	resolveDuration    *prometheus.HistogramVec
-	refreshTotal       *prometheus.CounterVec
-	watchErrorsTotal   *prometheus.CounterVec
-	staleTotal         *prometheus.CounterVec
-	changeDroppedTotal prometheus.Counter
-	applyRejectedTotal *prometheus.CounterVec
+	resolveDuration      *prometheus.HistogramVec
+	refreshTotal         *prometheus.CounterVec
+	watchErrorsTotal     *prometheus.CounterVec
+	staleTotal           *prometheus.CounterVec
+	changeDroppedTotal   prometheus.Counter
+	applyRejectedTotal   *prometheus.CounterVec
+	bootstrapFailedTotal prometheus.Counter
 }
 
+// mamori only reaches RecordBootstrapWriteFailed through a type assertion for
+// the optional mamori.BootstrapMeter, so dropping or renaming that method would
+// not break any build: the counter would just silently stop being recorded.
+// This turns that into a compile error.
+var _ mamori.BootstrapMeter = (*meter)(nil)
+
 // New builds a mamori.Meter backed by Prometheus client_golang, creating and
-// registering six instruments against reg up front:
+// registering seven instruments against reg up front:
 //
 //   - a HistogramVec "mamori_resolve_duration_seconds" recording resolve
 //     latency in seconds, labeled "scheme", "status" (ok|error), and
@@ -103,7 +118,8 @@ type meter struct {
 //   - a CounterVec "mamori_watch_errors_total" labeled "scheme";
 //   - a CounterVec "mamori_stale_total" labeled "scheme";
 //   - a bare Counter "mamori_change_dropped_total", with no labels;
-//   - a CounterVec "mamori_apply_rejected_total" labeled "reason".
+//   - a CounterVec "mamori_apply_rejected_total" labeled "reason";
+//   - a bare Counter "mamori_bootstrap_write_failed_total", with no labels.
 //
 // An error is returned (rather than a panic) if any instrument cannot be
 // registered against reg, so a caller registering twice, or against a
@@ -158,13 +174,22 @@ func New(reg prometheus.Registerer) (mamori.Meter, error) {
 		return nil, err
 	}
 
+	bootstrapFailedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: MetricBootstrapWriteFailedTotal,
+		Help: "Number of mamori bootstrap cache snapshot writes that failed.",
+	})
+	if err := reg.Register(bootstrapFailedTotal); err != nil {
+		return nil, err
+	}
+
 	return &meter{
-		resolveDuration:    resolveDuration,
-		refreshTotal:       refreshTotal,
-		watchErrorsTotal:   watchErrorsTotal,
-		staleTotal:         staleTotal,
-		changeDroppedTotal: changeDroppedTotal,
-		applyRejectedTotal: applyRejectedTotal,
+		resolveDuration:      resolveDuration,
+		refreshTotal:         refreshTotal,
+		watchErrorsTotal:     watchErrorsTotal,
+		staleTotal:           staleTotal,
+		changeDroppedTotal:   changeDroppedTotal,
+		applyRejectedTotal:   applyRejectedTotal,
+		bootstrapFailedTotal: bootstrapFailedTotal,
 	}, nil
 }
 
@@ -210,4 +235,10 @@ func (m *meter) RecordChangeDropped() {
 // reason ("validation", "preapply", or "derive").
 func (m *meter) RecordApplyRejected(reason mamori.RejectReason) {
 	m.applyRejectedTotal.WithLabelValues(string(reason)).Inc()
+}
+
+// RecordBootstrapWriteFailed increments the bootstrap-snapshot-write-failure
+// counter. It carries no labels: there is one snapshot file per process.
+func (m *meter) RecordBootstrapWriteFailed() {
+	m.bootstrapFailedTotal.Inc()
 }

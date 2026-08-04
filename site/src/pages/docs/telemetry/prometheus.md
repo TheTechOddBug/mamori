@@ -5,7 +5,7 @@ title: Prometheus
 
 # Prometheus
 
-The `github.com/xavidop/mamori/x/prom` bridge (package `prom`) implements `mamori.Meter` directly against `prometheus/client_golang`, registering six instruments up front: resolve latency, refresh, watch-error, stale, dropped-change, and rejected-apply, all labeled with the provider scheme and, on failure, an `error_kind` classification. Reach for it when you run Prometheus without OpenTelemetry and want `client_golang` to be the only metrics dependency in your build.
+The `github.com/xavidop/mamori/x/prom` bridge (package `prom`) implements `mamori.Meter` directly against `prometheus/client_golang`, registering seven instruments up front: resolve latency, labeled with the provider scheme, a status, and an `error_kind` classification on failure; refresh, watch-error and stale counts, each labeled with the provider scheme; a rejected-apply count labeled with a `reason`; and dropped-change and bootstrap-write-failure counts, which carry no labels at all. Reach for it when you run Prometheus without OpenTelemetry and want `client_golang` to be the only metrics dependency in your build.
 
 Already on OpenTelemetry? Use [`x/otel`](/docs/telemetry/opentelemetry/) with a Prometheus exporter instead of this module: it gives you the same `/metrics` endpoint plus spans, through one metrics pipeline rather than two. `x/prom` exists specifically for shops using `client_golang` directly.
 
@@ -60,7 +60,7 @@ Every resolve now records to `mamori_resolve_duration_seconds`; failed resolves 
 
 ## Record metrics
 
-`New` registers six instruments up front, recording to them as mamori resolves and reconciles config. Pass the result to `mamori.WithMeter`:
+`New` registers seven instruments up front, recording to them as mamori resolves and reconciles config. Pass the result to `mamori.WithMeter`:
 
 ```go
 meter, err := mamoriprom.New(reg)
@@ -71,7 +71,7 @@ if err != nil {
 w, err := mamori.Watch[Config](ctx, mamori.WithMeter(meter))
 ```
 
-The six instruments and their labels:
+The seven instruments and their labels:
 
 | Instrument | Name | Kind | Unit | Labels |
 | --- | --- | --- | --- | --- |
@@ -81,12 +81,14 @@ The six instruments and their labels:
 | Stale count | `mamori_stale_total` | Counter | - | `scheme` |
 | Change dropped count | `mamori_change_dropped_total` | Counter | - | none |
 | Apply rejected count | `mamori_apply_rejected_total` | Counter | - | `reason` (`validation` \| `preapply` \| `derive`) |
+| Bootstrap write failed | `mamori_bootstrap_write_failed_total` | Counter | - | none |
 
 - `scheme` is the provider scheme of the resolved ref (e.g. `file`, `aws-sm`, `vault`).
 - `status` is `error` when the resolve returned a non-nil error, otherwise `ok`.
 - `error_kind` carries the same classification as `mamori.ErrorKind(err)`. Unlike `x/otel`, which omits its equivalent attribute entirely on success, `error_kind` here is the **empty string** on a successful resolve rather than absent - a Prometheus `HistogramVec` requires every series to share the same label set, so there is no "attribute not present" to fall back on. Filter on `status="error"` to select failures.
 - `mamori_change_dropped_total` carries no labels at all: the bounded `OnChange` dispatch queue it reports on is a process-wide property, not a per-scheme one. **This is the counter to alert on**: a non-zero rate means an `OnChange` handler is not keeping up with the rate of applied changes, and the oldest change events are being silently discarded as a result.
 - `reason` on the apply-rejected counter carries `mamori.RejectReason`, a closed set of exactly three values (`validation`, `preapply`, `derive`) so it stays a safe, bounded metric label rather than an unbounded free-form string.
+- `mamori_bootstrap_write_failed_total` counts [bootstrap cache](/docs/usage/bootstrap-cache/) snapshot writes that failed. This bridge records it with nothing extra to do; see [Writing your own sink](#writing-your-own-sink) if you do not use a bridge.
 
 The instrument names are also exported as constants (`MetricResolveDuration`, `MetricRefreshTotal`, `MetricWatchErrorsTotal`, `MetricStaleTotal`, `MetricChangeDroppedTotal`, `MetricApplyRejectedTotal`).
 
@@ -109,7 +111,20 @@ The core module takes no Prometheus dependency. `WithMeter` accepts the tiny int
 
 `New` returns an error if any instrument fails to register (a duplicate registration against the same `Registerer`, for instance), rather than panicking, matching `x/otel`'s `NewMeter`. The meter is safe for concurrent use.
 
+## Writing your own sink
+
 Because both bridges only implement the small `mamori.Meter` interface, you can also write your own sink (to statsd, a test recorder, or anything else) without pulling in either dependency. `mamori.Meter` has six methods (`RecordResolve`, `RecordRefresh`, `RecordWatchError`, `RecordStale`, `RecordChangeDropped`, `RecordApplyRejected`); a hand-written implementation must provide all six.
+
+One event lives outside that set. `mamori.BootstrapMeter` is an optional interface adding a seventh method, `RecordBootstrapWriteFailed()`, for the [bootstrap cache](/docs/usage/bootstrap-cache/) snapshot-write failure:
+
+```go
+type BootstrapMeter interface {
+	mamori.Meter
+	RecordBootstrapWriteFailed()
+}
+```
+
+Implementing it is opt-in: a sink providing only the six `Meter` methods keeps compiling and never sees this event. Add it if you use `WithBootstrapCache`. Both bridges implement it already.
 
 ## See also
 

@@ -173,6 +173,56 @@ func writeReportTable(stdout io.Writer, rep *mamori.Report) {
 	_, _ = fmt.Fprintf(stdout, "\n%s: %d field(s), snapshot %d (live %d)%s, generated %s\n",
 		status, len(rep.Fields), rep.Snapshot, rep.Live, pinned,
 		rep.GeneratedAt.Format(time.RFC3339))
+	writeBootstrapLine(stdout, rep)
+}
+
+// writeBootstrapLine renders the bootstrap cache summary under the status
+// line, and nothing at all when the target process is not using one.
+//
+// It is one line rather than a block because it answers one question: is this
+// process serving what its backends say, or what a file on its disk says. A
+// process that booted from a snapshot looks identical to a healthy one in
+// every other line of this output, which is exactly why it gets its own.
+//
+// It keeps saying so after the recovery, too. Once every field resolves live
+// again, Source flips back to backend and only BootstrapStatus.Restored still
+// records how this process started; an operator asking why a pod restarted an
+// hour ago is asking exactly that.
+func writeBootstrapLine(stdout io.Writer, rep *mamori.Report) {
+	bs := rep.Bootstrap
+	if bs == nil {
+		return
+	}
+	switch {
+	case rep.Source == mamori.SourceBootstrapCache:
+		_, _ = fmt.Fprintf(stdout, "BOOTSTRAP CACHE: serving a snapshot written %s ago; the backend has not been reached for every field since this process started\n",
+			bs.Age.Round(time.Second))
+	case !bs.Present:
+		_, _ = fmt.Fprintf(stdout, "bootstrap cache: no snapshot%s\n", bootstrapProblemSuffix(bs))
+	case !bs.FingerprintMatch:
+		_, _ = fmt.Fprintf(stdout, "bootstrap cache: snapshot written %s ago, but for a DIFFERENT config struct, so it cannot be restored%s\n",
+			bs.Age.Round(time.Second), bootstrapProblemSuffix(bs))
+	case bs.Restored:
+		// Source has already flipped back to backend here: this process booted
+		// from the snapshot and has since reached the backend for every field.
+		// Restored is the only thing left that still says so, and it is what an
+		// operator looking at a pod that restarted during an outage came for.
+		// Lower case, like the other recovered states: nothing is wrong now.
+		_, _ = fmt.Fprintf(stdout, "bootstrap cache: this process booted from a snapshot and has since resolved every field live; snapshot written %s ago, matching this config\n",
+			bs.Age.Round(time.Second))
+	default:
+		_, _ = fmt.Fprintf(stdout, "bootstrap cache: snapshot written %s ago, matching this config\n", bs.Age.Round(time.Second))
+	}
+}
+
+// bootstrapProblemSuffix appends the snapshot's reported problem, if it has
+// one. The Report never carries any part of the snapshot itself, so this is
+// always a reason, never contents.
+func bootstrapProblemSuffix(bs *mamori.BootstrapStatus) string {
+	if bs.Problem == "" {
+		return ""
+	}
+	return " (" + bs.Problem + ")"
 }
 
 // runCompare implements --compare: it statically extracts every

@@ -151,6 +151,30 @@ mamori.WithDerive(func(c *Config) error {
   reading this call site rather than a `source:` tag. `policy` still grants it
   nothing, since it has no ref.
 
+## Boot through a backend outage
+
+`WithBootstrapCache(path, key, ...)` keeps an encrypted snapshot of the last
+known-good **resolved values** on disk and boots from it when a cold start
+cannot reach the backend. `key` is exactly 32 bytes (AES-256-GCM); the file is
+written atomically, mode `0600`.
+
+```go
+mamori.WithBootstrapCache("/var/lib/app/mamori.snap", key,
+	mamori.BootstrapMaxAge(6*time.Hour))
+```
+
+- **It creates a file holding live credentials at rest that did not exist
+  before.** Say so when you recommend it.
+- **Fallback, never a fast path.** Every start resolves normally first. The
+  snapshot is read only if that fails, and only on `unavailable` or
+  `rate_limited`; `not_found`, `permission_denied`, `unauthenticated`, `invalid`
+  and `unknown` fail the start, as does a record whose `Value.NotAfter` passed.
+- `Health()` passes inside `BootstrapMaxAge` (default 24h) and returns a
+  `*BootstrapStaleError` past it. Set it to the rotation window of the
+  shortest-lived credential; `0` is unbounded and must be written explicitly.
+- Changing the config struct invalidates an older snapshot. Give each replica
+  its own path, on a volume that outlives the container.
+
 ## Force an immediate refresh
 
 `w.Refresh(ctx)` re-resolves every field now, bypassing poll intervals, and
@@ -211,6 +235,8 @@ provider's native watch when there is one and polls otherwise.
 | `WithQueueDepth(n)` | 16 | `OnChange` queue; drops oldest when full |
 | `WithBackoff(base, max)` | provider default | retry pacing after failures |
 | `WithStale(maxAge)` | off | a ref unrefreshed this long sends `OnError` a `*StaleError` |
+| `WithBootstrapCache(path, key, ...)` | off | boot from an encrypted on-disk snapshot when a cold start cannot reach the backend |
+| `BootstrapMaxAge(d)` | 24h | a `BootstrapOption`: how old a restored snapshot may be while `Health` passes |
 | `WithPreApplyTimeout(d)` | 10s | bound the `PreApply` hook |
 | `WithHistory(n)` | 0 | keep the last `n` snapshots |
 | `WithLogger(l)` | discard | structured trail; never logs a resolved value |

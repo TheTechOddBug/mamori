@@ -5,7 +5,7 @@ title: OpenTelemetry
 
 # OpenTelemetry
 
-The `github.com/xavidop/mamori/x/otel` bridge (package `mamoriotel`) turns mamori's config resolves into OpenTelemetry spans and metrics: one `mamori.resolve` span per resolve, plus latency, refresh, watch-error, stale, dropped-change, and rejected-apply instruments, all tagged with the provider scheme and, on failure, a `mamori.error.kind` classification. Reach for it when you already run OTel and want config resolution to show up in the same traces and dashboards as the rest of your service.
+The `github.com/xavidop/mamori/x/otel` bridge (package `mamoriotel`) turns mamori's config resolves into OpenTelemetry spans and metrics: one `mamori.resolve` span per resolve, plus a latency instrument tagged with the provider scheme, a status, and a `mamori.error.kind` classification on failure; refresh, watch-error and stale instruments, each tagged with the provider scheme; a rejected-apply instrument tagged with a `reason`; and dropped-change and bootstrap-write-failure instruments, which carry no attributes at all. Reach for it when you already run OTel and want config resolution to show up in the same traces and dashboards as the rest of your service.
 
 Running Prometheus without OpenTelemetry? See [Prometheus](/docs/telemetry/prometheus/) for `x/prom`, a sibling bridge that implements `mamori.Meter` directly against `prometheus/client_golang` instead of going through OTel.
 
@@ -83,7 +83,7 @@ Each resolve produces one span, summarized below:
 
 ## Record metrics
 
-`NewMeter` wraps an OTel `metric.Meter` and registers six instruments up front, recording to them as mamori resolves and reconciles config. Pass the result to `mamori.WithMeter`:
+`NewMeter` wraps an OTel `metric.Meter` and registers seven instruments up front, recording to them as mamori resolves and reconciles config. Pass the result to `mamori.WithMeter`:
 
 ```go
 meter, err := mamoriotel.NewMeter(otel.Meter("mamori"))
@@ -94,7 +94,7 @@ if err != nil {
 w, err := mamori.Watch[Config](ctx, mamori.WithMeter(meter))
 ```
 
-The six instruments and their attributes:
+The seven instruments and their attributes:
 
 | Instrument | Name | Kind | Unit | Attributes |
 | --- | --- | --- | --- | --- |
@@ -104,11 +104,13 @@ The six instruments and their attributes:
 | Stale count | `mamori.stale.count` | Int64 counter | - | `scheme` |
 | Change dropped count | `mamori.change.dropped.count` | Int64 counter | - | none |
 | Apply rejected count | `mamori.apply.rejected.count` | Int64 counter | - | `reason` (`validation` \| `preapply` \| `derive`) |
+| Bootstrap write failed | `mamori.bootstrap.write.failed.count` | Int64 counter | - | none |
 
 - `scheme` is the provider scheme of the resolved ref (e.g. `file`, `aws`, `vault`).
 - `status` is `error` when the resolve returned a non-nil error, otherwise `ok`.
 - `mamori.change.dropped.count` carries no attributes at all: the bounded `OnChange` dispatch queue it reports on is a process-wide property, not a per-scheme one. **This is the counter to alert on**: a non-zero rate means an `OnChange` handler is not keeping up with the rate of applied changes, and the oldest change events are being silently discarded as a result.
 - `reason` on the apply-rejected counter carries `mamori.RejectReason`, a closed set of exactly three values (`validation`, `preapply`, `derive`) so it stays a safe, bounded metric label rather than an unbounded free-form string.
+- `mamori.bootstrap.write.failed.count` counts [bootstrap cache](/docs/usage/bootstrap-cache/) snapshot writes that failed. This bridge records it with nothing extra to do; see [Writing your own sink](#writing-your-own-sink) if you do not use a bridge.
 
 The instrument names are also exported as constants (`MetricResolveDuration`, `MetricRefreshCount`, `MetricWatchErrors`, `MetricStaleCount`, `MetricChangeDroppedCount`, `MetricApplyRejectedCount`).
 
@@ -140,7 +142,20 @@ The core module takes no OpenTelemetry dependency. `WithMeter` and `WithTracer` 
 
 The Go package is named `mamoriotel` (rather than `otel`) so it can be imported alongside `go.opentelemetry.io/otel` without a name clash. `NewMeter` returns an error if any instrument fails to register, and the meter records measurements against `context.Background()`. Both adapters are safe for concurrent use.
 
+## Writing your own sink
+
 Because the bridge only implements the small `mamori.Meter` / `mamori.Tracer` interfaces, you can also write your own sink (to Prometheus, statsd, or a test recorder) without pulling in OpenTelemetry at all. `mamori.Meter` has six methods (`RecordResolve`, `RecordRefresh`, `RecordWatchError`, `RecordStale`, `RecordChangeDropped`, `RecordApplyRejected`); a hand-written implementation must provide all six. `RecordApplyRejected` takes a `mamori.RejectReason`, a closed string type with exactly three values (`mamori.RejectValidation`, `mamori.RejectPreApply`, `mamori.RejectDerive`) so it is safe to use as a metric label without risking unbounded cardinality.
+
+One event lives outside that set. `mamori.BootstrapMeter` is an optional interface adding a seventh method, `RecordBootstrapWriteFailed()`, for the [bootstrap cache](/docs/usage/bootstrap-cache/) snapshot-write failure:
+
+```go
+type BootstrapMeter interface {
+	mamori.Meter
+	RecordBootstrapWriteFailed()
+}
+```
+
+Implementing it is opt-in: a sink providing only the six `Meter` methods keeps compiling and never sees this event. Add it if you use `WithBootstrapCache`. Both bridges implement it already.
 
 ## See also
 
