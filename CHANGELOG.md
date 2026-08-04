@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.8.0](https://github.com/xavidop/mamori/compare/v1.7.0...v1.8.0) (2026-08-04)
+
+
+### Features
+
+* **httpcore,https:** a shared HTTP resolve core, and a generic https:// provider on it ([#117](https://github.com/xavidop/mamori/issues/117)) ([de594e0](https://github.com/xavidop/mamori/commit/de594e04d34654ac2b911f3094a89099b7a3ae50)), closes [#107](https://github.com/xavidop/mamori/issues/107)
+
 # [1.7.0](https://github.com/xavidop/mamori/compare/v1.6.2...v1.7.0) (2026-08-03)
 
 
