@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.11.0](https://github.com/xavidop/mamori/compare/v1.10.0...v1.11.0) (2026-08-04)
+
+
+### Features
+
+* **core:** WithBootstrapCache, so a restart survives a backend outage ([#147](https://github.com/xavidop/mamori/issues/147)) ([1b30f39](https://github.com/xavidop/mamori/commit/1b30f3984c53086d04b032e33da552b336953ef2))
+
 # [1.10.0](https://github.com/xavidop/mamori/compare/v1.9.1...v1.10.0) (2026-08-04)
 
 
