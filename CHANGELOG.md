@@ -2,6 +2,19 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.9.0](https://github.com/xavidop/mamori/compare/v1.8.0...v1.9.0) (2026-08-04)
+
+
+### Features
+
+* **bitwarden:** add Bitwarden Secrets Manager provider ([#138](https://github.com/xavidop/mamori/issues/138)) ([bba9576](https://github.com/xavidop/mamori/commit/bba95762af59555c6132eb72aae740108fa20a28))
+* **hcp-vault-secrets:** resolve secrets from HCP Vault Secrets over httpcore ([#135](https://github.com/xavidop/mamori/issues/135)) ([babae89](https://github.com/xavidop/mamori/commit/babae8987d1720867ae90376d18c93a5bbfd2a68))
+* **heroku:** resolve Heroku config vars in one request per app ([#136](https://github.com/xavidop/mamori/issues/136)) ([38482f7](https://github.com/xavidop/mamori/commit/38482f743699e761739216eb51db2ac051dbac47))
+* **infisical:** resolve secrets from Infisical over httpcore ([#133](https://github.com/xavidop/mamori/issues/133)) ([c68e593](https://github.com/xavidop/mamori/commit/c68e593a1ad074305e1f1074eb733ed14bbae153))
+* **nacos:** Alibaba Nacos provider with a native long-poll watch ([#139](https://github.com/xavidop/mamori/issues/139)) ([d51bb87](https://github.com/xavidop/mamori/commit/d51bb87ca9e093fbe22e3b74956c4ce79f97b4b5))
+* **posthog:** resolve PostHog feature flags over the v2 flags endpoint ([#134](https://github.com/xavidop/mamori/issues/134)) ([161b598](https://github.com/xavidop/mamori/commit/161b598c4d0db06cb2496ef76559e28259f8f28d))
+* **supabase:** resolve Supabase Vault secrets over PostgREST ([#137](https://github.com/xavidop/mamori/issues/137)) ([ba3cc55](https://github.com/xavidop/mamori/commit/ba3cc55fd39d98a6b9866c72ea46d58c44d26791))
+
 # [1.8.0](https://github.com/xavidop/mamori/compare/v1.7.0...v1.8.0) (2026-08-04)
 
 
