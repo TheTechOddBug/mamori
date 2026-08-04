@@ -50,6 +50,7 @@ Don't read either non-✅ state as broken: `not_found` is detected everywhere re
 | `redis://` | Redis | no | **native** (keyspace) | ✅ |
 | `consul://` | Consul | no | **native** | ✅ |
 | `etcd://` | etcd | no | **native** | ✅ |
+| `nacos://` | Nacos | no | **native** | ✅ |
 | `vercel-gc://` | Vercel Global Config | no | poll (digest) | ✅ |
 | `cloudflare-kv://` | Cloudflare Workers KV | no | poll | ✅ |
 | `heroku://` | Heroku Config Vars | yes | poll | ✅ |
@@ -91,7 +92,7 @@ The [mamori (client)](/docs/providers/mamori/) provider is the one shipped provi
 
 ## Watch behavior
 
-- **native** - the backend pushes changes (Kubernetes watch API, Consul blocking queries, a mamori config server's `/v1/watch` Server-Sent Events stream). mamori subscribes directly.
+- **native** - the backend pushes changes (Kubernetes watch API, Consul blocking queries, a Nacos long-poll listener, a mamori config server's `/v1/watch` Server-Sent Events stream). mamori subscribes directly.
 - **fsnotify** - a local file is watched for writes (built-in `file://`, `sops://`).
 - **lease-aware poll** - polling, but `Value.NotAfter` from a Vault lease triggers a refresh before expiry.
 - **poll** - mamori polls on `WithPollInterval` with jitter, using `Value.Version` to detect change.

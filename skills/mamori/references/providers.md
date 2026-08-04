@@ -38,6 +38,7 @@ Module path is `github.com/xavidop/mamori/providers/<name>`.
 | `k8s` | `k8s-secret://` `k8s-cm://` | `k8s-secret://ns/name#key` |
 | `consul` | `consul://` | `consul://app/config` |
 | `etcd` | `etcd://` | `etcd://app/config` |
+| `nacos` | `nacos://` | `nacos://prod/db.json#password` |
 | `vercel-gc` | `vercel-gc://` | `vercel-gc://my-flag`, `vercel-gc://ecfg_abc/my-flag` |
 | `cloudflare-kv` | `cloudflare-kv://` | `cloudflare-kv://log-level`, `cloudflare-kv://log-level?namespace=abcd1234` |
 | `heroku` | `heroku://` | Heroku config vars. `heroku://DATABASE_URL`, `heroku://my-app/API_TOKEN`, `heroku://SERVICE_ACCOUNT#/private_key`. The grammar is `heroku://<VAR>` or `heroku://<app>/<VAR>`; a third segment is refused. App precedence: ref path > `WithApp` > `HEROKU_APP` > `HEROKU_APP_NAME` (dyno metadata). Auth is `HEROKU_API_KEY`. **A `BatchProvider`**: one GET returns every config var of an app, so N refs cost one request per app. **Always `Sensitive`** - add-ons write `DATABASE_URL` into the same namespace as `LOG_LEVEL`. |
