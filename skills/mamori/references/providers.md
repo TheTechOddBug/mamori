@@ -1,8 +1,11 @@
 # mamori providers reference
 
 Each provider is a separate Go module (except the core built-ins). Add the
-module, then blank-import it so it registers its scheme. Ref syntax is
-`scheme://path#key?opts`; `#key` selects a field from a structured payload.
+module, then blank-import it so it registers its scheme - except `https`,
+whose `New` takes operator-supplied endpoints and returns an error, so it
+needs an ordinary import and an explicit `New(...)` call instead (see the
+`https` row below). Ref syntax is `scheme://path#key?opts`; `#key` selects a
+field from a structured payload.
 
 For authentication details and every option, see https://mamorigo.dev/docs/providers .
 
@@ -34,6 +37,7 @@ Module path is `github.com/xavidop/mamori/providers/<name>`.
 | `etcd` | `etcd://` | `etcd://app/config` |
 | `vercel-gc` | `vercel-gc://` | `vercel-gc://my-flag`, `vercel-gc://ecfg_abc/my-flag` |
 | `cloudflare-kv` | `cloudflare-kv://` | `cloudflare-kv://log-level`, `cloudflare-kv://log-level?namespace=abcd1234` |
+| `https` | `https://` | generic REST config/secrets. The authority is a **registered `Endpoint.Name`, not a hostname** - `https://billing/cfg#/db/pass` resolves against whatever `BaseURL` the endpoint named `billing` was registered with via `httpsprov.New`, never against a host literally named `billing`. **This is the one module you do NOT blank-import**: it has no `init`, because an `Endpoint` is entirely operator-supplied and `New` returns an error. Import it normally, call `httpsprov.New(...)`, and pass the result to `mamori.WithProvider`. |
 | `postgres` | `postgres://` | connection-string backed |
 | `mysql` | `mysql://` | connection-string backed |
 | `sqlite` | `sqlite://` | file-backed |
@@ -73,3 +77,14 @@ a custom provider, add its scheme: `mamori vet --secret-schemes=mysecrets ./...`
   wins; `onfail` handles a real error on the winner).
 - Middleware wraps any provider: `middleware.Cache`, `Audit`, `RateLimit`,
   `Failover`, `Prefix` (see https://mamorigo.dev/docs/middleware ).
+
+## Writing a new provider over a REST API
+
+`providers/httpcore` is not a provider and registers no scheme: it is the
+stdlib-only library the REST-backed providers are built on. Use it rather than
+hand-rolling `net/http`, and you inherit request building, `Bearer`/header/
+basic/query/OAuth2 authenticators, `ClassifyStatus` (plus its exact inverse
+`StatusForKind` for the conformance `Fail` hook), conditional GET via
+`Revalidator`, a bounded and always-drained response body, and a request path
+that cannot traverse out of the `BaseURL`. See
+https://mamorigo.dev/docs/writing-a-provider/httpcore .
