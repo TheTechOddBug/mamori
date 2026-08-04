@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+## [1.9.1](https://github.com/xavidop/mamori/compare/v1.9.0...v1.9.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* restore the provider registrations lost in the merge cascade ([#142](https://github.com/xavidop/mamori/issues/142)) ([889bda1](https://github.com/xavidop/mamori/commit/889bda17d0a9f54a273ae92bf81b713b3e4f31bb))
+
 # [1.9.0](https://github.com/xavidop/mamori/compare/v1.8.0...v1.9.0) (2026-08-04)
 
 
