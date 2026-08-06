@@ -2,6 +2,13 @@
 
 All notable changes to mamori are documented here. This file is generated from Conventional Commits by semantic-release.
 
+# [1.12.0](https://github.com/xavidop/mamori/compare/v1.11.1...v1.12.0) (2026-08-06)
+
+
+### Features
+
+* provider Close lifecycle contract, and flatten:"toml" ([#149](https://github.com/xavidop/mamori/issues/149)) ([e4f6b05](https://github.com/xavidop/mamori/commit/e4f6b05c76971f20e344f1a88fcec0dd7256abfb))
+
 ## [1.11.1](https://github.com/xavidop/mamori/compare/v1.11.0...v1.11.1) (2026-08-04)
 
 
