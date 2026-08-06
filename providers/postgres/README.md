@@ -132,6 +132,23 @@ p := postgres.New(postgres.WithPool(pool))
 | `WithChannel(name)` | `LISTEN`/`NOTIFY` channel for `Watch` (default `mamori_config`) |
 | `WithSensitive(true)` | Mark every resolved value `Sensitive` (drives redaction) |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, and
+any `Watch` started after `Close`, report
+`errors.Is(err, mamori.ErrUnavailable)` locally, without contacting the
+database. It closes the `pgxpool.Pool` this provider opened lazily. A pool
+injected with `WithPool` belongs to the caller and is left open; `New`
+followed by `Close` with no prior `Resolve` never dials, so there is nothing
+to close.
+
+`Close` does not stop a `Watch` that is already running. On a pool this
+provider opened, the watch starts failing, but it carries the pool's own
+closed-pool error rather than `mamori.ErrUnavailable`, so `errors.Is(err,
+mamori.ErrUnavailable)` is **false** for it. On a pool injected with
+`WithPool`, `Close` leaves the pool alone and the watch keeps serving live
+values. Cancel the watch's own context to stop it. [Close does not stop a
+Watch](https://mamorigo.dev/docs/writing-a-provider/#close-does-not-stop-a-watch)
+compares every provider.
+
 ## Native watch (LISTEN/NOTIFY)
 
 The provider implements `mamori.WatchableProvider` using PostgreSQL

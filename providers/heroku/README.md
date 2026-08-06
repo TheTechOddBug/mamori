@@ -163,6 +163,13 @@ that is neither `http` nor `https` is refused either way, because
 otherwise construct cleanly and fail on every single resolve with net/http's
 "unsupported protocol scheme".
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`
+reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting
+Heroku. Without `WithHTTPClient` it releases nothing: this provider builds no
+default client of its own to hold onto. A client injected with
+`WithHTTPClient` is never closed: `Close` may return its idle connections to
+the pool, but leaves the client usable.
+
 ## Batching
 
 `ResolveBatch` groups refs by app and issues **one request per app**. mamori

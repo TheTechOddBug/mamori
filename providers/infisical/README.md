@@ -304,6 +304,13 @@ same request as "present and empty".
 | `WithAllowInsecure()` | Permit an `http://` base URL, and nothing else |
 | `WithHTTPClient(c)` | Inject a custom `*http.Client` for both the login and the read; a nil client is a no-op |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`
+reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting
+Infisical. Without `WithHTTPClient` it releases nothing: this provider builds
+no default client of its own to hold onto. A client injected with
+`WithHTTPClient` is never closed: `Close` may return its idle connections to
+the pool, but leaves the client usable.
+
 ## Testing status
 
 Wire shapes are pinned from Infisical's own API reference on 2026-08-04:

@@ -89,6 +89,10 @@ type templateFetcher interface {
 type Provider struct {
 	mu      sync.Mutex
 	fetcher templateFetcher
+	// closed records that Close ran. It is what makes Close terminal: without
+	// it a closed provider keeps serving through the fetcher whose idle
+	// connections were just released, as though nothing had happened.
+	closed bool
 
 	// Configuration used to build the default (REST) fetcher lazily on first use.
 	projectID  string
@@ -154,10 +158,15 @@ func init() { mamori.Register(New()) }
 func (p *Provider) Scheme() string { return scheme }
 
 // getFetcher returns the backing template fetcher, building the default REST
-// fetcher lazily (and caching it) on first use.
+// fetcher lazily (and caching it) on first use. A closed provider is refused
+// here, before the cached-fetcher check, so nothing is served or built after
+// Close.
 func (p *Provider) getFetcher(ctx context.Context) (templateFetcher, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("firebase-rc: provider is closed: %w", mamori.ErrUnavailable)
+	}
 	if p.fetcher != nil {
 		return p.fetcher, nil
 	}
@@ -226,12 +235,37 @@ func (p *Provider) buildFetcher(ctx context.Context) (templateFetcher, error) {
 	}, nil
 }
 
-// Close releases idle connections held by a lazily-built HTTP client, if any.
-// It is safe to call multiple times.
+// Close is terminal: every later Resolve reports unavailable without
+// contacting the Remote Config API. It is safe to call multiple times, and on
+// a provider that never resolved.
+//
+// It also calls CloseIdleConnections on an httpClient supplied through
+// WithHTTPClient, but only when that client's Transport is non-nil: a nil
+// Transport is resolved by net/http to the process-global
+// http.DefaultTransport, and releasing idle connections there would evict
+// connections belonging to unrelated code elsewhere in the process rather
+// than anything this provider used. The client itself is never invalidated
+// either way - only its idle connections are ever released, so the caller's
+// own use of it is unaffected by closing this provider.
+//
+// On the default (no WithHTTPClient) path this releases nothing at all, and
+// that is not a gap this guard introduces: buildFetcher's default client
+// wraps *oauth2.Transport, which implements no CloseIdleConnections method,
+// so http.Client.CloseIdleConnections has always silently no-op'd on it.
+// Idle connections DO exist on that path - oauth2.Transport.Base is left nil,
+// so it falls through to http.DefaultTransport for the actual round trip,
+// same as every unguarded default client in this tier - they are simply not
+// this provider's alone to release, and there is no method to call that
+// would release only them. Only an injected client can ever be released
+// here.
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if hf, ok := p.fetcher.(*httpFetcher); ok && hf.httpClient != nil {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	if hf, ok := p.fetcher.(*httpFetcher); ok && hf.httpClient != nil && hf.httpClient.Transport != nil {
 		hf.httpClient.CloseIdleConnections()
 	}
 	return nil

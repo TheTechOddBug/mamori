@@ -120,4 +120,6 @@ Secrets Manager exposes no push channel, so mamori polls (interval + jitter). Co
 | `WithLeeway(d)` | How far before its stated expiry a cached token is renewed |
 | `WithAllowInsecure(yes)` | Permit an `http://` endpoint, and nothing else |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve` reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting Bitwarden. It also returns its own idle HTTP connections to the pool, and leaves connections belonging to the rest of your process alone. A client injected with `WithHTTPClient` is never closed, so it stays usable for whatever else holds it.
+
 The key derivation and the cipher are checked against test vectors published by Bitwarden, and the rest against an in-process HTTP fake, so the conformance suite runs without a Bitwarden organization. No ciphertext produced by Bitwarden's own servers has been decrypted by this code at authoring time; a `//go:build integration` test closes that gap against a real organization when `BWS_ACCESS_TOKEN` and `MAMORI_BWS_SECRET_ID` are set, and skips cleanly when they are not.

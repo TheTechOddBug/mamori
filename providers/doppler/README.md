@@ -34,6 +34,13 @@ mamori.WithProvider(doppler.New(doppler.WithToken("dp.st....")))
 mamori.WithProvider(doppler.New(doppler.WithBaseURL("https://api.doppler.com"), doppler.WithHTTPClient(myClient)))
 ```
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`
+reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting
+Doppler. It also returns its own idle HTTP connections to the pool, and leaves
+connections belonging to the rest of your process alone. A client injected
+with `WithHTTPClient` is never closed, so it stays usable for whatever else
+holds it.
+
 ## Watch
 
 No native change notification - mamori polls (interval + jitter). Configure with `mamori.WithPollInterval`.

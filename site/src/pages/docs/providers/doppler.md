@@ -63,6 +63,8 @@ mamori.WithProvider(dopplerprov.New(
 ))
 ```
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve` reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting Doppler. It also returns its own idle HTTP connections to the pool, and leaves connections belonging to the rest of your process alone. A client injected with `WithHTTPClient` is never closed, so it stays usable for whatever else holds it.
+
 ## Watch
 
 Doppler has no push channel, so mamori polls (`WithPollInterval` + jitter).

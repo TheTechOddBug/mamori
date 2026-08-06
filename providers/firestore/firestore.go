@@ -93,6 +93,18 @@ type Provider struct {
 
 	mu      sync.Mutex
 	backend backend
+	// ownBackend is true only when this provider built backend itself, through
+	// newBackend. A client handed over with WithClient belongs to the caller,
+	// who may still be using it elsewhere, so Close leaves it open. The
+	// fsBackend wrapper WithClient builds is not ownership: its Close closes
+	// the caller's *firestore.Client underneath.
+	ownBackend bool
+	// closed records that Close ran. It is what makes Close terminal: without
+	// it the nil backend Close leaves behind is indistinguishable from one that
+	// was never built, and the next Resolve or Watch would silently dial
+	// Firestore on ambient credentials to rebuild what it was just told to
+	// release.
+	closed bool
 	// newBackend builds the backing backend on first use. Overridable in tests.
 	newBackend func(ctx context.Context) (backend, error)
 }
@@ -111,6 +123,11 @@ func WithProjectID(projectID string) Option {
 // WithClient injects a pre-built *firestore.Client, bypassing lazy construction.
 // Use it when you build the client yourself (custom database ID, credentials, or
 // emulator endpoint).
+//
+// The client stays yours: Close leaves it open, since this provider has no way
+// to know what else you built it for. Close it yourself when you are done with
+// it. A client the provider builds for itself (the default, from Application
+// Default Credentials) is the provider's to release, and Close does release it.
 func WithClient(c *fs.Client) Option {
 	return func(p *Provider) {
 		if c != nil {
@@ -156,10 +173,14 @@ func init() { mamori.Register(New()) }
 func (p *Provider) Scheme() string { return scheme }
 
 // getBackend returns the backing backend, creating it lazily on first use.
-// Concurrent callers share one backend.
+// Concurrent callers share one backend. A closed provider is refused here,
+// before the nil check, so no client is ever rebuilt after Close.
 func (p *Provider) getBackend(ctx context.Context) (backend, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("firestore: provider is closed: %w", mamori.ErrUnavailable)
+	}
 	if p.backend != nil {
 		return p.backend, nil
 	}
@@ -171,14 +192,38 @@ func (p *Provider) getBackend(ctx context.Context) (backend, error) {
 		return nil, fmt.Errorf("firestore: creating client: %w", err)
 	}
 	p.backend = b
+	p.ownBackend = true
 	return b, nil
 }
 
-// Close releases the backing client, if one has been created.
+// Close releases the backing client, but only one this provider built itself. A
+// client supplied with WithClient belongs to the caller and is left open;
+// closing it would reach outside this provider and break whatever else the
+// caller is using it for.
+//
+// Marking the provider closed is unconditional, so Close is terminal either
+// way: every later Resolve, and any Watch STARTED after Close, reports
+// unavailable without touching the backend, whether or not there was anything
+// here to release. Calling it more than once, or on a provider that never
+// resolved, is a no-op.
+//
+// A Watch that was ALREADY RUNNING when Close is called is a different case
+// and is not covered by that guarantee. Close never reaches into a running
+// watch to end it (cancelling the watch's own context is the only shutdown
+// path), and that watch opened its snapshot listener before its loop started,
+// so it never passes getBackend's closed check again: what the listener does
+// once the client is closed is decided by the Firestore client, not here, and
+// is not guaranteed to report mamori.ErrUnavailable. A watch running on a
+// client injected with WithClient is unaffected, since Close never touches
+// that client.
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.backend == nil {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	if p.backend == nil || !p.ownBackend {
 		return nil
 	}
 	err := p.backend.Close()

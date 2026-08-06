@@ -40,6 +40,22 @@ mamori.WithProvider(k8s.New(k8s.WithKubeconfig("/path/to/kubeconfig")))
 mamori.WithProvider(k8s.NewConfigMap(k8s.WithClient(myClientset)))
 ```
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, and
+any `Watch` started after `Close`, report `errors.Is(err,
+mamori.ErrUnavailable)` locally, without contacting the cluster. It releases
+the idle HTTP connections behind a clientset this provider built itself,
+whether from the default kubeconfig/in-cluster resolution or from
+`WithClientFactory`, and leaves connections belonging to the rest of your
+process alone. A clientset injected directly with `WithClient` is never
+touched.
+
+`Close` does not stop a `Watch` that is already running: it keeps reporting
+real cluster changes indefinitely, since closing this provider only returns
+idle HTTP connections to the pool. Cancel the watch's own context to stop it.
+[Close does not stop a
+Watch](https://mamorigo.dev/docs/writing-a-provider/#close-does-not-stop-a-watch)
+compares every provider.
+
 ## Watch
 
 `Watch` opens a name-scoped watch and emits an `Update` on every Added/Modified event; it re-establishes (re-list + re-watch) if the server-side watch ends while the context is alive, and closes cleanly on cancellation.

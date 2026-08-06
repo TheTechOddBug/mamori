@@ -111,6 +111,18 @@ type Provider struct {
 
 	mu     sync.Mutex
 	client featureClient
+	// ownClient is true only when this provider built client itself, through
+	// newClient. A client handed over with WithClient belongs to the caller,
+	// who may still be using it elsewhere, so Close leaves it open. The
+	// sdkClient wrapper WithClient builds is not ownership: its Close closes
+	// the caller's *unleash.Client underneath.
+	ownClient bool
+	// closed records that Close ran. It is what makes Close terminal: without
+	// it the nil client Close leaves behind is indistinguishable from one that
+	// was never built, and the next Resolve would stand up a fresh Unleash
+	// client and block on its first fetch to rebuild what it was just told to
+	// release.
+	closed bool
 	// newClient builds the backing client on first use. Overridable in tests.
 	newClient func(ctx context.Context) (featureClient, error)
 }
@@ -143,6 +155,11 @@ func WithAppName(appName string) Option {
 // Use it when you build the client yourself (custom strategies, storage,
 // listener, or HTTP client). The provided client must already be initialized;
 // callers typically invoke client.WaitForReady() before handing it over.
+//
+// The client stays yours: Close leaves it open, since this provider has no way
+// to know what else you built it for. Close it yourself when you are done with
+// it. A client the provider builds for itself (the default, from WithURL or
+// UNLEASH_URL) is the provider's to release, and Close does release it.
 func WithClient(c *unleash.Client) Option {
 	return func(p *Provider) {
 		if c != nil {
@@ -232,10 +249,14 @@ func (p *Provider) buildClient() (featureClient, error) {
 }
 
 // getClient returns the backing client, creating it lazily on first use.
-// Concurrent callers share one client.
+// Concurrent callers share one client. A closed provider is refused here,
+// before the nil check, so no client is ever rebuilt after Close.
 func (p *Provider) getClient(ctx context.Context) (featureClient, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("mamori/unleash: provider is closed: %w", mamori.ErrUnavailable)
+	}
 	if p.client != nil {
 		return p.client, nil
 	}
@@ -247,14 +268,27 @@ func (p *Provider) getClient(ctx context.Context) (featureClient, error) {
 		return nil, err
 	}
 	p.client = c
+	p.ownClient = true
 	return c, nil
 }
 
-// Close releases the backing client, if one has been created.
+// Close releases the backing client, but only one this provider built itself. A
+// client supplied with WithClient belongs to the caller and is left open;
+// closing it would reach outside this provider and stop the refresh and metrics
+// goroutines of a client the caller is still evaluating toggles through.
+//
+// Marking the provider closed is unconditional, so Close is terminal either
+// way: every later Resolve reports unavailable without contacting the Unleash
+// server, whether or not there was anything here to release. Calling it more
+// than once, or on a provider that never resolved, is a no-op.
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.client == nil {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	if p.client == nil || !p.ownClient {
 		return nil
 	}
 	err := p.client.Close()

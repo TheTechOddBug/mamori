@@ -241,6 +241,13 @@ message.
 | `WithBaseURL(u)` | Override the API origin, for an `httptest.Server` or a proxy; a trailing slash is trimmed so joining it with a path never produces a double slash |
 | `WithHTTPClient(c)` | Inject a custom `*http.Client`; a nil client is a no-op |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`
+reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting
+Secret Manager. It also returns its own idle HTTP connections to the pool, and
+leaves connections belonging to the rest of your process alone. A client
+injected with `WithHTTPClient` is never closed, so it stays usable for
+whatever else holds it.
+
 ## No native watch
 
 The Secret Manager REST API exposes no streaming or blocking read, so this

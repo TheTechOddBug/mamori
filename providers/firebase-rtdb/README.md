@@ -131,6 +131,21 @@ range.
 Left alone, a database that is down is retried at 2s, 4s, 8s, ... up to every
 30s, and a healthy stream that drops is retried after about 2s.
 
+`Close()` marks the provider closed; afterwards every `Resolve`, and any
+`Watch` started after `Close`, report `errors.Is(err, mamori.ErrUnavailable)`
+locally, without contacting the Realtime Database. It releases no connection:
+this provider holds no `*http.Client` of its own, and a running `Watch`'s SSE
+stream is owned end to end by that watch's own goroutine, which already closes
+the stream on context cancellation. `Close` deliberately adds no second
+teardown path for a running watch.
+
+`Close` does not stop a `Watch` that is already running. Its stream stays
+open, but from then on every change the server pushes arrives as an error
+update carrying `errors.Is(err, mamori.ErrUnavailable)` instead of a value.
+Cancel the watch's own context to stop it. [Close does not stop a
+Watch](https://mamorigo.dev/docs/writing-a-provider/#close-does-not-stop-a-watch)
+compares every provider.
+
 ## Native watch (SSE streaming)
 
 The provider implements `mamori.WatchableProvider` using the Realtime Database

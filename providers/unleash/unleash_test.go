@@ -24,6 +24,13 @@ type toggle struct {
 type fakeClient struct {
 	mu      sync.Mutex
 	toggles map[string]toggle
+	// closed records a Close, so a test can assert whether the provider closed
+	// this client. It deliberately does not affect Exists/IsEnabled/GetVariant:
+	// the conformance kit builds two providers over one shared fake, and a fake
+	// that started reporting toggles missing after the first Close would report
+	// the resulting failure as "Resolve before Close", pointing at the wrong
+	// thing.
+	closed bool
 }
 
 func newFake() *fakeClient {
@@ -56,7 +63,20 @@ func (f *fakeClient) GetVariant(feature string) (name, payloadValue string) {
 	return t.variantName, t.payloadValue
 }
 
-func (f *fakeClient) Close() error { return nil }
+func (f *fakeClient) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+// isClosed reports whether Close has been called, under the same lock every
+// other field of the fake is read through.
+func (f *fakeClient) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
 
 func fakeProvider(f *fakeClient) *Provider {
 	return New(withClient(f))
@@ -273,5 +293,101 @@ func TestConformance(t *testing.T) {
 func TestEnabledFormatting(t *testing.T) {
 	if strconv.FormatBool(true) != "true" || strconv.FormatBool(false) != "false" {
 		t.Fatal("unexpected bool formatting")
+	}
+}
+
+// TestResolveAfterCloseIsUnavailable pins the terminal half of the Close
+// contract. The factory records every call, so the assertion is not that the
+// post-close Resolve was merely slow or merely failed, but that no client was
+// built at all: without the closed guard, Close's nil client reads as "not yet
+// created" and the next Resolve stands up a fresh Unleash client.
+func TestResolveAfterCloseIsUnavailable(t *testing.T) {
+	f := newFake()
+	f.set("new-checkout", toggle{enabled: true, variantName: "v1", payloadValue: "p"})
+	p := fakeProvider(f)
+	var calls int
+	p.newClient = func(context.Context) (featureClient, error) {
+		calls++
+		return f, nil
+	}
+
+	if _, err := p.Resolve(context.Background(), mustRef(t, "unleash://new-checkout")); err != nil {
+		t.Fatalf("Resolve before Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	if _, err := p.Resolve(context.Background(), mustRef(t, "unleash://new-checkout")); !errors.Is(err, mamori.ErrUnavailable) {
+		t.Fatalf("Resolve after Close = %v; want ErrUnavailable", err)
+	}
+	if calls != 0 {
+		t.Fatalf("factory called %d times, want 0: a closed provider rebuilt its client", calls)
+	}
+}
+
+// TestCloseWithoutResolveDoesNotBuildAClient covers the other lifecycle: a
+// configured-but-unused provider is closed without ever contacting the server.
+func TestCloseWithoutResolveDoesNotBuildAClient(t *testing.T) {
+	p := New(WithURL("https://unleash.example.com/api"))
+	var calls int
+	p.newClient = func(context.Context) (featureClient, error) {
+		calls++
+		return newFake(), nil
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("factory called %d times, want 0", calls)
+	}
+}
+
+// TestCloseLeavesInjectedClientOpen is the ownership half of the Close
+// contract: a client handed over by the caller belongs to the caller, so Close
+// must stop using it without closing it. withClient stands in for the public
+// WithClient here, which wraps a caller-built *unleash.Client in an sdkClient
+// whose Close would close that very client. The second assertion is what keeps
+// this from being half a fix: the provider must still go terminal, so declining
+// to close the caller's client cannot be implemented by declining to close at
+// all.
+func TestCloseLeavesInjectedClientOpen(t *testing.T) {
+	f := newFake()
+	f.set("new-checkout", toggle{enabled: true, variantName: "v1", payloadValue: "p"})
+	p := fakeProvider(f)
+
+	if _, err := p.Resolve(context.Background(), mustRef(t, "unleash://new-checkout")); err != nil {
+		t.Fatalf("Resolve before Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if f.isClosed() {
+		t.Error("Close closed an injected client; it belongs to the caller")
+	}
+	if _, err := p.Resolve(context.Background(), mustRef(t, "unleash://new-checkout")); !errors.Is(err, mamori.ErrUnavailable) {
+		t.Fatalf("Resolve after Close = %v; want ErrUnavailable", err)
+	}
+}
+
+// TestCloseReleasesSelfBuiltClient is the other side of the same rule: a client
+// the provider constructed for itself is the provider's to release.
+func TestCloseReleasesSelfBuiltClient(t *testing.T) {
+	f := newFake()
+	f.set("new-checkout", toggle{enabled: true, variantName: "v1", payloadValue: "p"})
+	p := New(WithURL("https://unleash.example.com/api"))
+	p.newClient = func(context.Context) (featureClient, error) { return f, nil }
+
+	if _, err := p.Resolve(context.Background(), mustRef(t, "unleash://new-checkout")); err != nil {
+		t.Fatalf("Resolve before Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !f.isClosed() {
+		t.Error("Close did not release a client the provider built itself")
 	}
 }

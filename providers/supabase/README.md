@@ -381,6 +381,13 @@ from a blank import is safe even when no credentials exist at process start.
 | `WithAllowInsecure()` | Permit an `http://` project URL, and nothing else |
 | `WithHTTPClient(c)` | Inject a custom `*http.Client`; a nil client is a no-op |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`
+reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting
+Supabase. Without `WithHTTPClient` it releases nothing: this provider builds
+no default client of its own to hold onto. A client injected with
+`WithHTTPClient` is never closed: `Close` may return its idle connections to
+the pool, but leaves the client usable.
+
 ### Local development
 
 `supabase start` serves the Data API from `http://127.0.0.1:54321`, so `http://`

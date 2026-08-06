@@ -119,6 +119,18 @@ type Provider struct {
 
 	mu     sync.Mutex
 	client treatmentClient
+	// ownClient is true only when this provider built client itself, through
+	// newClient. A client handed over with WithClient belongs to the caller,
+	// who may still be using it elsewhere, so Close leaves it alone. The
+	// sdkClient wrapper WithClient builds is not ownership: its Destroy
+	// destroys the caller's *splitclient.SplitClient underneath.
+	ownClient bool
+	// closed records that Close ran. It is what makes Close terminal: without
+	// it the nil client Close leaves behind is indistinguishable from one that
+	// was never built, and the next Resolve would stand up a fresh Split
+	// factory and block on its first flag sync to rebuild what it was just
+	// told to destroy.
+	closed bool
 	// newClient builds the backing client on first use. Overridable in tests.
 	newClient func(ctx context.Context) (treatmentClient, error)
 }
@@ -156,6 +168,12 @@ func WithConfig(cfg *splitconf.SplitSdkConfig) Option {
 // construction. Use it when you build the Split factory yourself. The provided
 // client must already be ready; callers typically invoke BlockUntilReady on the
 // factory (or client) before handing it over.
+//
+// The client stays yours: Close leaves it running, since this provider has no
+// way to know what else you built it for. Destroy it yourself when you are done
+// with it. A client the provider builds for itself (the default, from
+// WithAPIKey or SPLIT_API_KEY) is the provider's to destroy, and Close does
+// destroy it.
 func WithClient(c *splitclient.SplitClient) Option {
 	return func(p *Provider) {
 		if c != nil {
@@ -247,10 +265,14 @@ func (p *Provider) buildClient() (treatmentClient, error) {
 }
 
 // getClient returns the backing client, creating it lazily on first use.
-// Concurrent callers share one client.
+// Concurrent callers share one client. A closed provider is refused here,
+// before the nil check, so no client is ever rebuilt after Close.
 func (p *Provider) getClient(ctx context.Context) (treatmentClient, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("mamori/split: provider is closed: %w", mamori.ErrUnavailable)
+	}
 	if p.client != nil {
 		return p.client, nil
 	}
@@ -262,14 +284,27 @@ func (p *Provider) getClient(ctx context.Context) (treatmentClient, error) {
 		return nil, err
 	}
 	p.client = c
+	p.ownClient = true
 	return c, nil
 }
 
-// Close releases the backing client, if one has been created.
+// Close destroys the backing client, but only one this provider built itself. A
+// client supplied with WithClient belongs to the caller and is left running;
+// destroying it would reach outside this provider and flush and tear down a
+// factory the caller is still evaluating flags through.
+//
+// Marking the provider closed is unconditional, so Close is terminal either
+// way: every later Resolve reports unavailable without contacting Split,
+// whether or not there was anything here to destroy. Calling it more than once,
+// or on a provider that never resolved, is a no-op.
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.client == nil {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	if p.client == nil || !p.ownClient {
 		return nil
 	}
 	p.client.Destroy()

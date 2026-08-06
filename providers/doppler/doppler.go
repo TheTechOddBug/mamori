@@ -41,6 +41,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xavidop/mamori"
@@ -70,6 +71,9 @@ type Provider struct {
 	token      string
 	baseURL    string
 	httpClient *http.Client
+
+	mu     sync.Mutex
+	closed bool
 }
 
 // Option configures a Provider.
@@ -141,6 +145,13 @@ type secretResponse struct {
 // interpolates ref.Path into a path anyway (the project and config travel as
 // query parameters), but the guarantee is inherited rather than re-stated.
 func (p *Provider) Resolve(ctx context.Context, ref mamori.Ref) (mamori.Value, error) {
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return mamori.Value{}, fmt.Errorf("%w: mamori/doppler: provider is closed", mamori.ErrUnavailable)
+	}
+
 	project, config, err := parsePath(ref.Path)
 	if err != nil {
 		return mamori.Value{}, err
@@ -248,6 +259,32 @@ func errorDetail(status int, body []byte) string {
 		body = body[:errBodyLimit]
 	}
 	return strings.TrimSpace(string(body))
+}
+
+// Close marks the provider closed and returns its idle HTTP connections to the
+// pool. It is idempotent, and afterwards Resolve reports
+// errors.Is(err, mamori.ErrUnavailable) locally, without contacting Doppler.
+//
+// A client supplied through WithHTTPClient is never invalidated: only its idle
+// connections are released (Go's transport redials on demand), so the caller's
+// own use of that client is unaffected by closing this provider.
+//
+// CloseIdleConnections is skipped when the tracked client's Transport is nil.
+// New's own default (unless overridden by WithHTTPClient) is exactly that
+// shape - &http.Client{Timeout: ...} with no Transport set - and net/http
+// resolves a nil Transport to the process-global http.DefaultTransport.
+// Calling CloseIdleConnections on that client would evict idle connections
+// belonging to whatever OTHER code in this process also leaves its Transport
+// unset (anything built on http.DefaultClient), not just this provider's own
+// traffic, so the guard fires on an ordinary, never-injected Provider too.
+func (p *Provider) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	if p.httpClient != nil && p.httpClient.Transport != nil {
+		p.httpClient.CloseIdleConnections()
+	}
+	return nil
 }
 
 // resolveToken returns the configured token, or DOPPLER_TOKEN read lazily.

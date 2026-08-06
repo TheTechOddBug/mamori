@@ -120,6 +120,23 @@ p := redis.New(redis.WithClient(client))
 | `WithDB(db)` | Logical database number; also selects the `__keyspace@<db>__` channel `Watch` subscribes to |
 | `WithClient(goredis.UniversalClient)` | Inject a pre-configured client (`*redis.Client`, `*redis.ClusterClient`, or `*redis.Ring`) |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, and
+any `Watch` started after `Close`, report
+`errors.Is(err, mamori.ErrUnavailable)` locally, without contacting Redis. It
+releases the go-redis client, including its connection pool, that this
+provider built lazily. A client injected with `WithClient` belongs to the
+caller and is left open; `New` followed by `Close` with no prior `Resolve`
+never dials, so there is nothing to release.
+
+`Close` does not stop a `Watch` that is already running, and on a client this
+provider built itself that watch can go quiet rather than fail: no error
+reaches your handler, and `Watcher.Get()` keeps serving the last value it saw,
+indefinitely. A client injected with `WithClient` is never closed, so a watch
+running on one keeps delivering live events. Either way, cancel the watch's
+own context to stop it; `Close` is not a substitute. [Close does not stop a
+Watch](https://mamorigo.dev/docs/writing-a-provider/#close-does-not-stop-a-watch)
+compares every provider.
+
 ## Native watch (keyspace notifications)
 
 The provider implements `mamori.WatchableProvider` using **Redis keyspace

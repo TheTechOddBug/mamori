@@ -74,6 +74,7 @@ type Provider struct {
 
 	mu        sync.Mutex
 	snapshots map[string]*snapshot
+	closed    bool
 }
 
 // snapshot is the last observed body of one store, tagged with the digest that
@@ -135,6 +136,33 @@ func init() { mamori.Register(New()) }
 
 // Scheme returns "vercel-gc".
 func (p *Provider) Scheme() string { return scheme }
+
+// Close marks the provider closed and returns its idle HTTP connections to the
+// pool. It is idempotent, and afterwards Resolve reports
+// errors.Is(err, mamori.ErrUnavailable) locally, through the same closed check
+// clientFor already applies, without contacting Vercel.
+//
+// A client supplied through WithHTTPClient is never invalidated: only its idle
+// connections are released (Go's transport redials on demand), so the caller's
+// own use of that client is unaffected by closing this provider.
+//
+// CloseIdleConnections is skipped when the tracked client's Transport is nil.
+// New's own default (unless overridden by WithHTTPClient) is exactly that
+// shape - &http.Client{Timeout: ...} with no Transport set - and net/http
+// resolves a nil Transport to the process-global http.DefaultTransport.
+// Calling CloseIdleConnections on that client would evict idle connections
+// belonging to whatever OTHER code in this process also leaves its Transport
+// unset (anything built on http.DefaultClient), not just this provider's own
+// traffic, so the guard fires on an ordinary, never-injected Provider too.
+func (p *Provider) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	if p.httpClient != nil && p.httpClient.Transport != nil {
+		p.httpClient.CloseIdleConnections()
+	}
+	return nil
+}
 
 // connection resolves the effective connection, reading the environment lazily.
 // Precedence: WithConnectionString, then explicit WithStoreID/WithToken, then

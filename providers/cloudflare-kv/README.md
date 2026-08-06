@@ -220,6 +220,15 @@ it, and never echoes a credential that is set.
 | `WithBaseURL(u)` | Override the API origin, for an `httptest.Server` or a proxy; a trailing slash is trimmed so joining it with a path never produces a double slash |
 | `WithHTTPClient(c)` | Inject a custom `*http.Client`; a nil client is a no-op |
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, and
+every `ResolveBatch` called with at least one ref, report `errors.Is(err,
+mamori.ErrUnavailable)` locally, without contacting Workers KV (calling
+`ResolveBatch` with no refs still returns an empty result and no error). It
+also returns its own idle HTTP connections to the pool, and leaves connections
+belonging to the rest of your process alone. A client injected with
+`WithHTTPClient` is never closed, so it stays usable for whatever else holds
+it.
+
 ## No native watch
 
 The Workers KV REST API exposes no streaming read, no blocking read, and no

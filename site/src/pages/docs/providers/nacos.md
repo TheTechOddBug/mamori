@@ -107,10 +107,15 @@ p := nacos.New(
 	nacos.WithNamespace("2f9d1b0c-..."),
 	nacos.WithCredentials(os.Getenv("NACOS_USERNAME"), os.Getenv("NACOS_PASSWORD")),
 )
+defer p.Close() // you own p; mamori never closes it
 cfg, err := mamori.Load[Config](ctx, mamori.WithProvider(p))
 ```
 
 Supplying only one of username and password is a configuration error rather than a silent fallback to unauthenticated requests, which would work against a server with auth disabled and fail with an opaque 403 against every other one. For any other Nacos auth mode, including the accessKey/secretKey signature Alibaba Cloud's hosted MSE Nacos issues, pass an `httpcore.Authenticator` to `WithAuth`.
+
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, and any `Watch` started after `Close`, report `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting the Nacos server. Without `WithHTTPClient` it releases nothing: the client built for that unconfigured case belongs to an internal helper, not to a field `Close` holds a reference to. A client injected with `WithHTTPClient` is never closed: `Close` may return its idle connections to the pool, but leaves the client usable.
+
+`Close` does not stop a `Watch` that is already running. Every long-poll round from then on reports `errors.Is(err, mamori.ErrUnavailable)` as an error update, and the loop keeps going until you stop it. Cancel the watch's own context to stop it. [Close does not stop a Watch](/docs/writing-a-provider/#close-does-not-stop-a-watch) compares every provider.
 
 **Nacos carries its access token in the query string**, which this provider follows, and a stock Nacos deployment is cleartext `http` on port 8848. A query parameter is in the request line, which a proxy's access log and the server's own request log record in plaintext. Put a TLS terminator in front of Nacos and point `NACOS_SERVER_ADDR` at the `https://` address unless the network between your application and Nacos is already private. Neither the password nor the token is held in a readable struct field, and `httpcore` strips the query from every error it returns, including the `*url.Error` that `net/http` wraps a transport failure in.
 

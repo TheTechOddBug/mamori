@@ -152,6 +152,7 @@ p := supabase.New(
 	supabase.WithProjectURL(os.Getenv("SUPABASE_URL")),
 	supabase.WithServiceKey(os.Getenv("SUPABASE_SERVICE_ROLE_KEY")),
 )
+defer p.Close() // you own p; mamori never closes it
 cfg, err := mamori.Load[Config](ctx, mamori.WithProvider(p))
 ```
 
@@ -174,6 +175,8 @@ The environment is read lazily at the first resolve, so a blank import is safe e
 | `WithView(name)` | Set the relation for refs with no `?view=`; a name with a slash is rejected |
 | `WithAllowInsecure()` | Permit an `http://` project URL, and nothing else |
 | `WithHTTPClient(c)` | Inject a custom `*http.Client`; a nil client is a no-op |
+
+`Close()` is idempotent and terminal: after it returns, every `Resolve` reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting Supabase. Without `WithHTTPClient` it releases nothing: this provider builds no default client of its own to hold onto. A client injected with `WithHTTPClient` is never closed: `Close` may return its idle connections to the pool, but leaves the client usable.
 
 `supabase start` serves the Data API from `http://127.0.0.1:54321` for local development, which requires `WithAllowInsecure()`. It takes no argument and permits cleartext `http`, nothing else.
 

@@ -10,6 +10,7 @@ import (
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"github.com/launchdarkly/go-sdk-common/v3/ldreason"
 	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
+	ldclient "github.com/launchdarkly/go-server-sdk/v7"
 	"github.com/launchdarkly/go-server-sdk/v7/interfaces"
 
 	"github.com/xavidop/mamori"
@@ -28,6 +29,7 @@ type fakeClient struct {
 	flags     map[string]ldvalue.Value
 	fails     map[string]fakeFailure
 	listeners map[*fakeListener]struct{}
+	closed    bool
 }
 
 // fakeFailure is an injected per-flag evaluation failure: the error
@@ -154,10 +156,13 @@ func (f *fakeClient) RemoveFlagValueChangeListener(listener <-chan interfaces.Fl
 	}
 }
 
-// Close implements ldEvaluator, closing any remaining listener channels.
+// Close implements ldEvaluator, closing any remaining listener channels and
+// recording that Close was called, so tests can assert whether a
+// caller-injected fake was (or was not) released.
 func (f *fakeClient) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.closed = true
 	for l := range f.listeners {
 		delete(f.listeners, l)
 		close(l.ch)
@@ -478,6 +483,123 @@ func TestFlagValueToBytes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Close ---
+
+// TestCloseWithoutUseIsSafe pins the "safe with no prior use" half of the
+// Close contract: Close on a provider that never resolved must not connect to
+// LaunchDarkly and must not panic, and a second Close must stay clean.
+func TestCloseWithoutUseIsSafe(t *testing.T) {
+	p := New()
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close on an unused provider: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if p.ownClient || p.cli != nil {
+		t.Error("Close built a client on a provider that never resolved")
+	}
+}
+
+// TestResolveAfterCloseIsUnavailable pins the terminal half of the contract:
+// once Close has run, Resolve must refuse locally (via the p.closed check in
+// conn) rather than reaching into the fake client it was told to stop using.
+func TestResolveAfterCloseIsUnavailable(t *testing.T) {
+	fake := newFakeClient()
+	fake.set("flag", ldvalue.String("v"))
+	p := New(withClient(fake))
+
+	if _, err := p.Resolve(context.Background(), mustRef(t, "launchdarkly://flag")); err != nil {
+		t.Fatalf("Resolve before Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, err := p.Resolve(context.Background(), mustRef(t, "launchdarkly://flag")); !errors.Is(err, mamori.ErrUnavailable) {
+		t.Fatalf("Resolve after Close = %v; want ErrUnavailable", err)
+	}
+}
+
+// TestCloseDoesNotCloseInjectedClient is the ownership half of rule 5: an
+// *ldclient.LDClient handed in with WithClient belongs to the caller, so
+// Close must stop using it without closing it.
+//
+// The two assertions below split rule 5 across two different mechanisms
+// because no single one covers both:
+//
+//  1. WithClient must never set p.ownClient. This is checked against the real
+//     public API with a real (offline, non-network) *ldclient.LDClient, since
+//     that is the only way to prove WithClient's Option func itself does not
+//     flip the flag - the internal seam below bypasses WithClient entirely
+//     and cannot see a regression there.
+//  2. Close must not call Close on the client once ownClient is (correctly)
+//     false. mongodb/etcd/redis prove this against their real clients, because
+//     each SDK's second Close/Disconnect returns a distinguishable
+//     already-closed error. *ldclient.LDClient offers no such signal: its
+//     Close is unconditionally idempotent and returns nil every time, even
+//     against the same offline client used in (1) (verified directly against
+//     the SDK). A real client would give this half of the test nothing to
+//     assert against, so it uses the internal ldEvaluator seam (p.cli = fake)
+//     and the fake's explicit closed flag instead.
+//
+// It also proves the other half of rule 5's ordering requirement - that Close
+// still marks the provider closed on the not-owned path - since a Close that
+// returned early here (skipping p.closed = true to avoid touching the
+// injected client) would pass the "not closed" assertion below while silently
+// breaking Resolve's terminality for every WithClient caller.
+func TestCloseDoesNotCloseInjectedClient(t *testing.T) {
+	// (1) WithClient itself must not claim ownership. ldclient.MakeCustomClient
+	// with Offline: true returns instantly with no network access (verified
+	// directly against the SDK), so this needs no reachable LaunchDarkly
+	// service.
+	real, err := ldclient.MakeCustomClient("fake-sdk-key", ldclient.Config{Offline: true}, 0)
+	if err != nil {
+		t.Fatalf("MakeCustomClient: %v", err)
+	}
+	defer func() { _ = real.Close() }()
+	if p := New(WithClient(real)); p.ownClient {
+		t.Fatal("WithClient claimed ownership of the injected client")
+	}
+
+	// (2) Given ownClient is false, Close must leave the client alone.
+	fake := newFakeClient()
+	fake.set("flag", ldvalue.String("v"))
+	p := New()
+	p.cli = fake // stands in for WithClient's *ldclient.LDClient: the caller owns this
+
+	if _, err := p.Resolve(context.Background(), mustRef(t, "launchdarkly://flag")); err != nil {
+		t.Fatalf("Resolve before Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if fake.closed {
+		t.Error("Close closed a caller-injected client; the caller owns it")
+	}
+	if _, err := p.Resolve(context.Background(), mustRef(t, "launchdarkly://flag")); !errors.Is(err, mamori.ErrUnavailable) {
+		t.Fatalf("Resolve after Close = %v; want ErrUnavailable (closed flag not set on the injected path)", err)
+	}
+}
+
+// TestCloseReleasesSelfBuiltClient, the positive half of rule 5's ownership
+// tracking (the mirror image of the WithClient half above), is deliberately
+// NOT implemented here. Reaching conn()'s dial branch means calling
+// ldclient.MakeClient with a real SDK key against LaunchDarkly's real
+// streaming endpoint - MakeClient takes no custom endpoint override - so
+// exercising it needs either live LaunchDarkly credentials or up to
+// initTimeout (10s) blocked on an unreachable network per run. Unlike
+// mongodb/etcd/redis, whose lazy constructors (mongo.Connect, clientv3.New,
+// goredis.NewClient) never dial synchronously, there is no way to force this
+// provider's owned-build site without a live backend. That path is exercised
+// by launchdarkly_integration_test.go (//go:build integration) instead.
+func TestCloseReleasesSelfBuiltClient(t *testing.T) {
+	t.Skip("conn()'s dial branch (ldclient.MakeClient) cannot be reached without live " +
+		"LaunchDarkly credentials or a real network wait; see launchdarkly_integration_test.go")
 }
 
 func resolveStr(t *testing.T, p *Provider, ref string) string {

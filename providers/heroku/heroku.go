@@ -140,12 +140,13 @@ type Provider struct {
 	allowInsecure bool
 	httpClient    *http.Client
 
-	// mu guards client, which is built on the first resolve rather than in New
-	// so that reading the environment (and validating the base URL) happens
-	// after process start. Registering from init must not require a token to
-	// already exist.
+	// mu guards client and closed. client is built on the first resolve rather
+	// than in New so that reading the environment (and validating the base URL)
+	// happens after process start. Registering from init must not require a
+	// token to already exist.
 	mu     sync.Mutex
 	client *httpcore.Client
+	closed bool
 }
 
 // target is the app and config var name one ref addresses. Every read is scoped
@@ -291,9 +292,16 @@ func (p *Provider) targetFor(ref mamori.Ref) (target, error) {
 // A construction failure is deliberately NOT cached. A process whose token
 // arrives after start (a mounted secret, a sidecar-populated environment) then
 // succeeds on a later poll instead of being poisoned by the first attempt.
+//
+// The closed check runs first, ahead of the p.client != nil cache check, so a
+// closed provider refuses locally even when a client built before Close is
+// still sitting in p.client.
 func (p *Provider) clientFor() (*httpcore.Client, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("%w: mamori/heroku: provider is closed", mamori.ErrUnavailable)
+	}
 	if p.client != nil {
 		return p.client, nil
 	}
@@ -333,6 +341,32 @@ func (p *Provider) clientFor() (*httpcore.Client, error) {
 	}
 	p.client = c
 	return c, nil
+}
+
+// Close marks the provider closed and returns its idle HTTP connections to the
+// pool. It is idempotent, and afterwards Resolve reports
+// errors.Is(err, mamori.ErrUnavailable) locally, through the same closed check
+// clientFor already applies, without contacting Heroku.
+//
+// A client supplied through WithHTTPClient is never invalidated: only its idle
+// connections are released (Go's transport redials on demand), so the caller's
+// own use of that client is unaffected by closing this provider. Without
+// WithHTTPClient, httpClient is nil and Close releases nothing: this provider
+// builds no default client of its own to own.
+//
+// CloseIdleConnections is also skipped when an injected client's Transport is
+// nil, since net/http resolves that to the process-global
+// http.DefaultTransport, and releasing idle connections there would evict
+// connections belonging to unrelated code elsewhere in the process rather
+// than anything this provider used.
+func (p *Provider) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	if p.httpClient != nil && p.httpClient.Transport != nil {
+		p.httpClient.CloseIdleConnections()
+	}
+	return nil
 }
 
 // checkBaseURLScheme rejects a base URL this package will not send an API token

@@ -110,6 +110,8 @@ type Provider struct {
 	// the identical error, so the difference is invisible from the outside and
 	// a test written without this cannot tell the two apart.
 	builds int
+	// closed is set once by Close and never cleared. See core.
+	closed bool
 }
 
 // Option configures a Provider.
@@ -233,11 +235,52 @@ func init() { mamori.Register(New()) }
 // Scheme returns "nacos".
 func (p *Provider) Scheme() string { return scheme }
 
+// Close marks the provider closed and returns its idle HTTP connections to the
+// pool. It is idempotent, and afterwards Resolve, and any Watch STARTED after
+// Close, report errors.Is(err, mamori.ErrUnavailable) locally, through the
+// same closed check core already applies, without contacting the Nacos server.
+//
+// A Watch that was ALREADY RUNNING when Close is called is not ended by Close
+// (cancelling the watch's own context is the only shutdown path), but it does
+// degrade to an error stream rather than going quiet: every long-poll round
+// re-enters core's closed check before it sends anything, so each round
+// reports mamori.ErrUnavailable as an Update{Err} and the loop keeps going
+// until its context is cancelled.
+//
+// A client supplied through WithHTTPClient is never invalidated: only its idle
+// connections are released (Go's transport redials on demand), so the caller's
+// own use of that client is unaffected by closing this provider. Without
+// WithHTTPClient, httpClient is nil and Close releases nothing: watchSafeClient
+// builds its own client for the unconfigured case, and this provider holds no
+// reference to that one for Close to reach.
+//
+// CloseIdleConnections is also skipped when an injected client's Transport is
+// nil, since net/http resolves that to the process-global
+// http.DefaultTransport, and releasing idle connections there would evict
+// connections belonging to unrelated code elsewhere in the process rather
+// than anything this provider used.
+func (p *Provider) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	if p.httpClient != nil && p.httpClient.Transport != nil {
+		p.httpClient.CloseIdleConnections()
+	}
+	return nil
+}
+
 // core returns the shared httpcore.Client, building it on first use from the
 // ambient environment overlaid with whatever options were supplied.
+//
+// The closed check runs first, ahead of the p.client != nil cache check, so a
+// closed provider refuses locally even when a client built before Close is
+// still sitting in p.client.
 func (p *Provider) core() (*httpcore.Client, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("nacos: provider is closed: %w", mamori.ErrUnavailable)
+	}
 	if p.client != nil {
 		return p.client, nil
 	}

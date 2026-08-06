@@ -46,7 +46,7 @@ cfg, err := mamori.Load[Config](ctx) // *Config, or an error and no partial stru
 - `optional:"true"` leaves a missing field at its zero value instead of failing.
 - `validate:` uses go-playground/validator/v10 syntax and runs on load AND on
   every reconciled update; an invalid update is rejected atomically.
-- `flatten:"json|yaml|env"` decodes one payload into a nested struct.
+- `flatten:"json|yaml|toml|env"` decodes one payload into a nested struct.
 
 ## Ref syntax
 
@@ -313,3 +313,11 @@ permission.
   that an `OnChange` handler is too slow to keep up.
 - Point to https://mamorigo.dev/docs for provider auth and the config server
   (a separate fan-out module, `github.com/xavidop/mamori/server`).
+- A provider you construct explicitly, rather than reaching via its default
+  blank-imported instance, is yours to close. Most providers with a real
+  backend connection ship `Close() error` (databases, caches, secret managers,
+  feature-flag SDKs); pair `p := x.New(...)` with `defer p.Close()`. mamori
+  never closes a provider itself: `Watcher.Close()` releases only the watch
+  goroutines, callback queue, and admin server it created. Providers with
+  nothing to release (`env`, `file`, `aws-sm`, and others) have no `Close` at
+  all, so there is nothing to add.

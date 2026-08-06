@@ -133,6 +133,21 @@ Supplying only one of username and password is a configuration error rather
 than a silent fallback to unauthenticated requests, which would work against a
 server with auth disabled and fail with an opaque 403 against every other one.
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, and
+any `Watch` started after `Close`, report `errors.Is(err,
+mamori.ErrUnavailable)` locally, without contacting the Nacos server. Without
+`WithHTTPClient` it releases nothing: the client built for that unconfigured
+case belongs to an internal helper, not to a field `Close` holds a reference
+to. A client injected with `WithHTTPClient` is never closed: `Close` may
+return its idle connections to the pool, but leaves the client usable.
+
+`Close` does not stop a `Watch` that is already running. Every long-poll round
+from then on reports `errors.Is(err, mamori.ErrUnavailable)` as an error
+update, and the loop keeps going until you stop it. Cancel the watch's own
+context to stop it. [Close does not stop a
+Watch](https://mamorigo.dev/docs/writing-a-provider/#close-does-not-stop-a-watch)
+compares every provider.
+
 ### The access token travels in the query string
 
 Nacos's documented way to carry a token is a query parameter:

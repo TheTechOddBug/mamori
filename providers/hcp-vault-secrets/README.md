@@ -273,6 +273,13 @@ two from different hosts. A single override would force a test double to
 impersonate both, and would send the client secret to whichever host an operator
 pointed the API at.
 
+`Close()` is idempotent and terminal: after it returns, every `Resolve`
+reports `errors.Is(err, mamori.ErrUnavailable)` locally, without contacting
+HCP. Without `WithHTTPClient` it releases nothing: this provider builds no
+default client of its own to hold onto. A client injected with
+`WithHTTPClient` is never closed: `Close` may return its idle connections to
+the pool, but leaves the client usable.
+
 ## Testing status
 
 | Behaviour | Status | Pinned by |

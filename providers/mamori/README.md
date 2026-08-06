@@ -61,6 +61,28 @@ Setting a single-element `Endpoints` behaves exactly like the equivalent `Endpoi
 - `Value.Sensitive` also survives the hop unchanged, so redaction downstream of `Load`/`Watch` keeps working exactly as if the field had resolved against the upstream provider directly.
 - Client credentials are attached with `mamoriprov.WithHeader`/`mamoriprov.WithRequestEditor` (Bearer/API key/basic auth), or `Config.TLSConfig.Certificates` for mTLS. This package deliberately does not reuse `mamori.Authenticator`, since that authenticates an inbound request on the server side, a different shape from attaching a credential to an outbound one. `PeerCred` needs no client-side configuration; the kernel supplies the credential over the Unix socket.
 
+## Closing the provider
+
+This provider is yours to close; mamori never closes a provider it was handed.
+
+`Close()` is idempotent and terminal: after it returns, every `Resolve`, every
+`ResolveBatch`, and any `Watch` started after `Close`, report
+`errors.Is(err, mamori.ErrUnavailable)` locally, without contacting any
+replica. It returns every endpoint's idle HTTP connections to the pool. Unlike
+most HTTP-backed providers here, this happens in the default configuration too:
+an endpoint built without `Config.HTTPClient` gets its own real
+`*http.Transport`, which belongs to this provider alone. A client supplied
+through `Config.HTTPClient` is never closed or invalidated, only its idle
+connections are released, and only when that client's `Transport` is non-nil.
+
+`Close` does not stop a `Watch` that is already running. The SSE connection it
+is streaming on is not one of the idle connections `Close` releases, so it
+keeps delivering live updates until it next reconnects; from there it becomes
+an error stream carrying `errors.Is(err, mamori.ErrUnavailable)`, retried with
+backoff. Cancel the watch's own context to stop it. [Close does not stop a
+Watch](https://mamorigo.dev/docs/writing-a-provider/#close-does-not-stop-a-watch)
+compares every provider.
+
 ## Documentation
 
 - 📖 **Full docs for this provider:** https://mamorigo.dev/docs/providers/mamori

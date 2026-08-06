@@ -61,6 +61,15 @@ type objectReader interface {
 type Provider struct {
 	mu     sync.Mutex
 	reader objectReader
+	// ownReader is true only when this provider built reader itself, through
+	// newReader. A reader handed over with WithClient belongs to the caller,
+	// who may still be using it elsewhere, so Close leaves it open.
+	ownReader bool
+	// closed records that Close ran. It is what makes Close terminal: without
+	// it the nil reader Close leaves behind is indistinguishable from one that
+	// was never built, and the next Resolve would silently dial Cloud Storage
+	// on ambient credentials to rebuild what it was just told to release.
+	closed bool
 	// newReader builds the backing client on first use. Overridable in tests via
 	// WithClient (which sets reader directly) or WithClientFactory.
 	newReader func(ctx context.Context) (objectReader, error)
@@ -74,6 +83,11 @@ type Option func(*Provider)
 // WithClient injects a pre-built object reader. The real Google Cloud Storage
 // client satisfies objectReader through NewClientReader; tests pass an
 // in-memory fake. When set, no lazy client is created.
+//
+// The reader stays yours: Close leaves it open, since this provider has no way
+// to know what else you built it for. Close it yourself when you are done with
+// it. A client the provider builds for itself (the default, or WithClientFactory)
+// is the provider's to release, and Close does release it.
 func WithClient(r objectReader) Option {
 	return func(p *Provider) { p.reader = r }
 }
@@ -82,6 +96,9 @@ func WithClient(r objectReader) Option {
 // first use. It is primarily useful for advanced configuration (custom
 // option.ClientOptions, an emulator endpoint) or testing; most callers rely on
 // the default (Application Default Credentials).
+//
+// Unlike WithClient, the reader the factory returns is built on the provider's
+// behalf and released by Close.
 func WithClientFactory(f func(ctx context.Context) (objectReader, error)) Option {
 	return func(p *Provider) { p.newReader = f }
 }
@@ -119,9 +136,14 @@ func init() { mamori.Register(New()) }
 func (p *Provider) Scheme() string { return scheme }
 
 // getReader returns the backing object reader, creating it lazily on first use.
+// A closed provider is refused here, before the nil check, so no client is ever
+// rebuilt after Close.
 func (p *Provider) getReader(ctx context.Context) (objectReader, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("gcs: provider is closed: %w", mamori.ErrUnavailable)
+	}
 	if p.reader != nil {
 		return p.reader, nil
 	}
@@ -133,14 +155,27 @@ func (p *Provider) getReader(ctx context.Context) (objectReader, error) {
 		return nil, fmt.Errorf("gcs: creating client: %w", err)
 	}
 	p.reader = r
+	p.ownReader = true
 	return r, nil
 }
 
-// Close releases the backing client, if one has been created.
+// Close releases the backing client, but only one this provider built itself. A
+// reader supplied with WithClient belongs to the caller and is left open;
+// closing it would reach outside this provider and break whatever else the
+// caller is using it for.
+//
+// Marking the provider closed is unconditional, so Close is terminal either
+// way: every later Resolve reports unavailable without touching the backend,
+// whether or not there was anything here to release. Calling it more than once,
+// or on a provider that never resolved, is a no-op.
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.reader == nil {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	if p.reader == nil || !p.ownReader {
 		return nil
 	}
 	err := p.reader.Close()
